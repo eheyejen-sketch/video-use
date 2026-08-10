@@ -38,6 +38,12 @@ except Exception:
         return "eq=contrast=1.03:saturation=0.98", {}
 
 
+# The default Homebrew ffmpeg formula is built without libass, so the
+# `subtitles` filter isn't available on it. ffmpeg-full (keg-only, installed
+# side-by-side, does not affect the system ffmpeg other tools depend on) has
+# libass. Only the subtitle-burning composite below needs this binary.
+FFMPEG_SUBTITLES_BIN = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"
+
 # -------- Subtitle style (bold-overlay, proven at 1920×1080 and 1080×1920) --
 #
 # MarginV is NOT taste — it is a platform safe-zone rule.
@@ -553,7 +559,7 @@ def build_final_composite(
     filter_complex = ";".join(filter_parts)
 
     cmd = [
-        "ffmpeg", "-y",
+        FFMPEG_SUBTITLES_BIN if has_subs else "ffmpeg", "-y",
         *inputs,
         "-filter_complex", filter_complex,
         "-map", out_label,
