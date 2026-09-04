@@ -1,3 +1,4 @@
+#!/Users/mikeattreys/Developer/video-use/.venv/bin/python3
 """Pack all Scribe transcripts in <edit>/transcripts/ into one readable markdown.
 
 Groups word-level entries into phrase-level lines, breaking on any silence

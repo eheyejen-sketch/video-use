@@ -1,3 +1,4 @@
+#!/Users/mikeattreys/Developer/video-use/.venv/bin/python3
 """Filmstrip + waveform composite PNG for a time range of a video.
 
 The only visual drill-down tool. Given a video and a [start, end] range,

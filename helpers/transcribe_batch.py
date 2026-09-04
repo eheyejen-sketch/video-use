@@ -1,3 +1,4 @@
+#!/Users/mikeattreys/Developer/video-use/.venv/bin/python3
 """Batch-transcribe every video in a directory with 4 parallel workers.
 
 Walks <videos_dir> for common video extensions, runs ElevenLabs Scribe on

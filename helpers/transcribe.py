@@ -1,3 +1,4 @@
+#!/Users/mikeattreys/Developer/video-use/.venv/bin/python3
 """Transcribe a video with local Whisper (openai-whisper) — free, fully offline.
 
 Drop-in replacement for the original ElevenLabs Scribe-based transcribe.py

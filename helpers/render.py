@@ -1,3 +1,4 @@
+#!/Users/mikeattreys/Developer/video-use/.venv/bin/python3
 """Render a video from an EDL.
 
 Implements the HEURISTICS render pipeline in the correct order:
@@ -44,10 +45,13 @@ except Exception:
         return "eq=contrast=1.03:saturation=0.98", {}
 
 
-# The default Homebrew ffmpeg formula is built without libass, so the
-# `subtitles` filter isn't available on it. ffmpeg-full (keg-only, installed
-# side-by-side, does not affect the system ffmpeg other tools depend on) has
-# libass. Only the subtitle-burning composite below needs this binary.
+# The default Homebrew ffmpeg formula is built without libass or libzimg, so
+# neither the `subtitles` filter nor `zscale` (used by TONEMAP_CHAIN for HDR
+# sources) are available on it. ffmpeg-full (keg-only, installed side-by-side,
+# does not affect the system ffmpeg other tools depend on) has both. Used by
+# the subtitle-burning composite below AND by extract_segment() whenever the
+# source is HDR — verified directly: default ffmpeg fails with "No such
+# filter: 'zscale'" on a real HDR .MOV.
 FFMPEG_SUBTITLES_BIN = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"
 
 # -------- Subtitle style (bold-overlay, proven at 1920×1080 and 1080×1920) --
@@ -58,13 +62,19 @@ FFMPEG_SUBTITLES_BIN = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"
 # the bottom edge get clipped or obscured by the UI. libass auto-scales the
 # render canvas relative to PlayResY=288, so MarginV=90 lands the caption
 # baseline roughly 30% up from the bottom on any aspect — clear of the UI on
-# every major vertical-video platform. Do not drop this below ~75 without a
-# specific reason.
+# every major vertical-video platform. Default floor is ~75 for that reason.
+#
+# Lowered to 50 on 2026-09-04 per Mike's explicit request (close talking-head
+# framing put the caption near his chin/collarbone) — a real specific reason,
+# not casual drift. This trades some platform-UI safe-zone margin for staying
+# clear of the face; re-check against the actual target platform's UI before
+# a real publish, don't assume 50 is still clear once export destination is
+# decided.
 SUB_FORCE_STYLE = (
     "FontName=Helvetica,FontSize=18,Bold=1,"
     "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,"
     "BorderStyle=1,Outline=2,Shadow=0,"
-    "Alignment=2,MarginV=90"
+    "Alignment=2,MarginV=50"
 )
 
 # -------- Helpers ------------------------------------------------------------
@@ -152,7 +162,12 @@ def is_portrait_source(video: Path) -> bool:
              "-of", "csv=p=0", str(video)],
             capture_output=True, text=True, check=True,
         )
-        w, h = map(int, out.stdout.strip().split(","))
+        # csv output can carry a trailing comma (extra empty field) depending
+        # on container/stream layout — verified on a real .MOV — which broke
+        # this 2-way unpack and was silently swallowed by this except clause,
+        # defaulting to False (landscape) on an actual portrait source.
+        parts = out.stdout.strip().split(",")
+        w, h = int(parts[0]), int(parts[1])
         return h > w
     except Exception:
         return False
@@ -189,7 +204,8 @@ def extract_segment(
         scale = "scale=-2:1920" if portrait else "scale=1920:-2"
 
     vf_parts: list[str] = []
-    if is_hdr_source(source):
+    hdr = is_hdr_source(source)
+    if hdr:
         vf_parts.append(TONEMAP_CHAIN)
     vf_parts.append(scale)
     if grade_filter:
@@ -208,7 +224,7 @@ def extract_segment(
         preset, crf = "fast", "20"
 
     cmd = [
-        "ffmpeg", "-y",
+        FFMPEG_SUBTITLES_BIN if hdr else "ffmpeg", "-y",
         "-ss", f"{seg_start:.3f}",
         "-i", str(source),
         "-t", f"{duration:.3f}",
