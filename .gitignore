@@ -22,6 +22,7 @@ dist/
 venv/
 env/
 ENV/
+.matte-venv/
 
 # Editors / IDEs
 .vscode/
@@ -54,6 +55,9 @@ preview.mp4
 final.mp4
 base.mp4
 base_preview.mp4
+base_matted.mp4
+base_draft.mp4
+*.video_only.mp4
 master.srt
 takes_packed.md
 edl.json

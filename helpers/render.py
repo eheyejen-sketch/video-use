@@ -4,6 +4,8 @@ Implements the HEURISTICS render pipeline in the correct order:
 
   1. Per-segment extract with color grade + 30ms audio fades baked in
   2. Lossless -c copy concat into base.mp4
+  2.5. If EDL has "background": replace the background behind the person
+     (RVM matting, no green screen needed) — becomes the new base
   3. If overlays or subtitles: single filter graph that overlays animations
      (with PTS shift so frame 0 lands at the overlay window start)
      and applies `subtitles` filter LAST → final.mp4
@@ -17,6 +19,10 @@ Usage:
     python helpers/render.py <edl.json> -o preview.mp4 --preview
     python helpers/render.py <edl.json> -o final.mp4 --build-subtitles
     python helpers/render.py <edl.json> -o final.mp4 --no-subtitles
+    python helpers/render.py <edl.json> -o final.mp4 --no-matte
+
+EDL background field (optional):
+    {"background": "path/to/bg.png", ...}
 """
 
 from __future__ import annotations
@@ -268,6 +274,32 @@ def extract_all_segments(
 
 
 # -------- Lossless concat ----------------------------------------------------
+
+
+def apply_background_matte(base_path: Path, bg_ref: str, edit_dir: Path) -> Path:
+    """Replace the background behind the person in `base_path` via RVM matting.
+    Runs matte.py as a subprocess in its own venv (torch lives there, not in
+    video-use's main deps — see helpers/matte.py's module docstring). Returns
+    the new base path to use downstream; on failure, prints a warning and
+    returns the original `base_path` unchanged rather than aborting the render.
+    """
+    bg_path = resolve_path(bg_ref, edit_dir)
+    if not bg_path.exists():
+        print(f"warning: background path in EDL does not exist, skipping matte: {bg_path}")
+        return base_path
+
+    matte_script = Path(__file__).parent / "matte.py"
+    matted_path = base_path.with_name(base_path.stem + "_matted.mp4")
+    print(f"background matte ({bg_path.name}) → {matted_path.name}")
+    try:
+        subprocess.run(
+            [str(matte_script), str(base_path), "-o", str(matted_path), "--bg", str(bg_path)],
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"warning: background matte failed ({e}), continuing with unmatted base")
+        return base_path
+    return matted_path
 
 
 def concat_segments(segment_paths: list[Path], out_path: Path, edit_dir: Path) -> None:
@@ -603,6 +635,11 @@ def main() -> None:
         help="Skip subtitles even if the EDL references one",
     )
     ap.add_argument(
+        "--no-matte",
+        action="store_true",
+        help="Skip background matting even if the EDL references a background image",
+    )
+    ap.add_argument(
         "--no-loudnorm",
         action="store_true",
         help="Skip audio loudness normalization. Default is on (-14 LUFS, -1 dBTP, LRA 11).",
@@ -631,6 +668,11 @@ def main() -> None:
         base_name = "base.mp4"
     base_path = edit_dir / base_name
     concat_segments(segment_paths, base_path, edit_dir)
+
+    # 2.5. Background matte (optional) — if the EDL names a background image,
+    # replace the background behind the person and use that as the new base.
+    if edl.get("background") and not args.no_matte:
+        base_path = apply_background_matte(base_path, edl["background"], edit_dir)
 
     # 3. Subtitles: build if requested, resolve final path
     subs_path: Path | None = None
