@@ -73,6 +73,8 @@ Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this
 
 ## Helpers
 
+**`transcribe.py` and `render.py` on real footage often exceed a blocking shell call's timeout.** A blocking call that times out kills the process mid-run and writes zero output — confirmed 2026-09-07: repeated blocking retries via OpenClaw's `exec` tool all died at the same ~2-minute mark with nothing written to `transcripts/`, on two separate agent accounts, every attempt. Retrying the same way does not help. In Claude Code, use `Bash` with `run_in_background: true` for these two scripts and poll with `Monitor`/`Bash` output checks rather than a blocking call. In OpenClaw (Jensen/Beast), launch with `exec({..., background: true})` and poll the returned session via `process({action:"poll", ...})`.
+
 - **`transcribe.py <video>`** — local Whisper (openai-whisper), not ElevenLabs Scribe — this fork was rewritten 2026-07-27 to run fully offline, no API key. `--model turbo` (default) or `--model large-v3`. Cached. **Normalizes out filler words ("um"/"uh") by default** — pass `--verbatim` to prime it with a verbatim-transcript prompt instead (added 2026-09-04, verified: surfaced 12 real fillers a default transcription showed zero of). Cached separately per mode (checked via a `verbatim` field in the transcript JSON) so switching modes re-transcribes correctly.
 - **`transcribe_batch.py <videos_dir>`** — 4-worker parallel transcription. Use for multi-take.
 - **`pack_transcripts.py --edit-dir <dir>`** — `transcripts/*.json` → `takes_packed.md` (phrase-level, break on silence ≥ 0.5s).
