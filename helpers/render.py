@@ -33,7 +33,11 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _job_lock  # noqa: E402
 
 try:
     from grade import get_preset, auto_grade_for_clip  # same directory
@@ -723,7 +727,11 @@ def build_final_composite(
 # -------- Main ---------------------------------------------------------------
 
 
-def main() -> None:
+def _job_key(out_path: Path) -> str:
+    return f"render_{out_path.stem}"
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Render a video from an EDL")
     ap.add_argument("edl", type=Path, help="Path to edl.json")
     ap.add_argument("-o", "--output", type=Path, required=True, help="Output video path")
@@ -764,15 +772,22 @@ def main() -> None:
              "skips real speech. Use only after reviewing the warnings yourself "
              "and confirming the cut is intentional.",
     )
-    args = ap.parse_args()
+    ap.add_argument(
+        "--status",
+        action="store_true",
+        help="Report status of a background render job for this output path instead of "
+             "starting one: RUNNING: / DONE: / FAILED: / NOT_FOUND:. Exit 0 unless failed/not_found.",
+    )
+    ap.add_argument(
+        "--_worker",
+        action="store_true",
+        help=argparse.SUPPRESS,  # internal: runs the actual render synchronously
+    )
+    return ap
 
-    edl_path = args.edl.resolve()
-    if not edl_path.exists():
-        sys.exit(f"edl not found: {edl_path}")
 
+def _run_render(args: argparse.Namespace, edl_path: Path, edit_dir: Path, out_path: Path) -> None:
     edl = json.loads(edl_path.read_text())
-    edit_dir = edl_path.parent
-    out_path = args.output.resolve()
 
     # 0. Validate cuts against the real transcript before doing any work.
     # See validate_cuts_against_transcripts()'s docstring/comment for why this
@@ -837,6 +852,72 @@ def main() -> None:
 
     size_mb = out_path.stat().st_size / (1024 * 1024)
     print(f"\ndone: {out_path} ({size_mb:.1f} MB)")
+
+
+def main() -> None:
+    args = _build_arg_parser().parse_args()
+
+    edl_path = args.edl.resolve()
+    if not edl_path.exists():
+        sys.exit(f"edl not found: {edl_path}")
+
+    edit_dir = edl_path.parent
+    out_path = args.output.resolve()
+    job_key = _job_key(out_path)
+
+    if args.status:
+        sys.exit(_job_lock.print_status_line(edit_dir, job_key, cached_output=out_path))
+
+    if args._worker:
+        # Runs detached, spawned by the block below. Does the real render and
+        # reports the outcome into the lock file for --status to read.
+        try:
+            _run_render(args, edl_path, edit_dir, out_path)
+            _job_lock.mark_done(edit_dir, job_key, str(out_path))
+        except SystemExit as e:
+            _job_lock.mark_failed(edit_dir, job_key, str(e.code))
+            raise
+        except Exception as e:  # noqa: BLE001 -- must record failure, not crash silently
+            _job_lock.mark_failed(edit_dir, job_key, str(e))
+            raise
+        return
+
+    # Foreground entry point: never blocks on the actual render (which can
+    # run minutes on a full clip with matte/overlays) -- either a job for
+    # this output is already running (reports status, does not launch a
+    # duplicate ffmpeg/matte pipeline), or a new background worker is
+    # spawned and this call returns right away. Same self-backgrounding
+    # rationale as transcribe.py -- see _job_lock.py.
+    running = _job_lock.check_running_job(edit_dir, job_key)
+    if running:
+        elapsed = time.time() - running.get("started_at", time.time())
+        print(
+            f"ALREADY_RUNNING: elapsed={elapsed:.0f}s pid={running.get('pid')} -- "
+            f"poll with: render.py {edl_path} -o {out_path} --status"
+        )
+        return
+
+    worker_argv = [sys.executable, str(Path(__file__).resolve()), str(edl_path), "-o", str(out_path), "--_worker"]
+    if args.preview:
+        worker_argv.append("--preview")
+    if args.draft:
+        worker_argv.append("--draft")
+    if args.build_subtitles:
+        worker_argv.append("--build-subtitles")
+    if args.no_subtitles:
+        worker_argv.append("--no-subtitles")
+    if args.no_matte:
+        worker_argv.append("--no-matte")
+    if args.no_loudnorm:
+        worker_argv.append("--no-loudnorm")
+    if args.force:
+        worker_argv.append("--force")
+
+    job = _job_lock.spawn_background_worker(edit_dir, job_key, worker_argv)
+    print(
+        f"STARTED: pid={job['pid']} -- "
+        f"poll with: render.py {edl_path} -o {out_path} --status"
+    )
 
 
 if __name__ == "__main__":

@@ -33,6 +33,9 @@ import tempfile
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _job_lock  # noqa: E402
+
 WHISPER_BIN = "whisper"
 DEFAULT_MODEL = "turbo"
 DEFAULT_DEVICE = "cpu"  # MPS is broken for word-level timestamps in this openai-whisper
@@ -185,6 +188,10 @@ def transcribe_one(
     return out_path
 
 
+def _job_key(video: Path, verbatim: bool) -> str:
+    return f"transcribe_{video.stem}_{'verbatim' if verbatim else 'default'}"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Transcribe a video with local Whisper (free, offline)")
     ap.add_argument("video", type=Path, help="Path to video file")
@@ -218,6 +225,17 @@ def main() -> None:
         help="Prime Whisper to include filler words (um/uh) it otherwise normalizes out. "
              "Use before a filler-removal cut. Re-transcribes if the cached file used a different mode.",
     )
+    ap.add_argument(
+        "--status",
+        action="store_true",
+        help="Report status of a background job for this (video, mode) instead of starting one: "
+             "RUNNING: / DONE: / FAILED: / NOT_FOUND:. Exit 0 unless failed/not_found.",
+    )
+    ap.add_argument(
+        "--_worker",
+        action="store_true",
+        help=argparse.SUPPRESS,  # internal: runs the actual transcription synchronously
+    )
     args = ap.parse_args()
 
     video = args.video.resolve()
@@ -225,14 +243,68 @@ def main() -> None:
         sys.exit(f"video not found: {video}")
 
     edit_dir = (args.edit_dir or (video.parent / "edit")).resolve()
+    job_key = _job_key(video, args.verbatim)
+    cached_output = edit_dir / "transcripts" / f"{video.stem}.json"
 
-    transcribe_one(
-        video=video,
-        edit_dir=edit_dir,
-        language=args.language,
-        num_speakers=args.num_speakers,
-        model=args.model,
-        verbatim=args.verbatim,
+    if args.status:
+        sys.exit(_job_lock.print_status_line(edit_dir, job_key, cached_output=cached_output))
+
+    if args._worker:
+        # Runs detached, spawned by the block below. Does the real work and
+        # reports the outcome into the lock file for --status to read.
+        try:
+            out_path = transcribe_one(
+                video=video,
+                edit_dir=edit_dir,
+                language=args.language,
+                num_speakers=args.num_speakers,
+                model=args.model,
+                verbatim=args.verbatim,
+            )
+            _job_lock.mark_done(edit_dir, job_key, str(out_path))
+        except Exception as e:  # noqa: BLE001 -- must record failure, not crash silently
+            _job_lock.mark_failed(edit_dir, job_key, str(e))
+            raise
+        return
+
+    # Foreground entry point. Fast in every case: either the transcript is
+    # already cached (returns immediately), a job for it is already running
+    # (reports status, does not launch a duplicate whisper process), or a
+    # new background worker is spawned and this call returns right away --
+    # never blocks on the actual transcription, regardless of how it's
+    # invoked (Bash, OpenClaw's exec, or a plain shell script).
+    if cached_output.exists():
+        try:
+            cached = json.loads(cached_output.read_text())
+        except (json.JSONDecodeError, OSError):
+            cached = {}
+        if cached.get("verbatim", False) == args.verbatim:
+            print(f"CACHED: {cached_output}")
+            return
+
+    running = _job_lock.check_running_job(edit_dir, job_key)
+    if running:
+        elapsed = time.time() - running.get("started_at", time.time())
+        print(
+            f"ALREADY_RUNNING: elapsed={elapsed:.0f}s pid={running.get('pid')} -- "
+            f"poll with: transcribe.py {video} --status" + (" --verbatim" if args.verbatim else "")
+        )
+        return
+
+    worker_argv = [sys.executable, str(Path(__file__).resolve()), str(video), "--_worker"]
+    if args.edit_dir:
+        worker_argv += ["--edit-dir", str(edit_dir)]
+    if args.language:
+        worker_argv += ["--language", args.language]
+    if args.model != DEFAULT_MODEL:
+        worker_argv += ["--model", args.model]
+    if args.verbatim:
+        worker_argv += ["--verbatim"]
+
+    job = _job_lock.spawn_background_worker(edit_dir, job_key, worker_argv)
+    print(
+        f"STARTED: pid={job['pid']} -- "
+        f"poll with: transcribe.py {video} --status" + (" --verbatim" if args.verbatim else "")
     )
 
 
