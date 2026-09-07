@@ -232,6 +232,21 @@ def main() -> None:
              "RUNNING: / DONE: / FAILED: / NOT_FOUND:. Exit 0 unless failed/not_found.",
     )
     ap.add_argument(
+        "--notify-session",
+        type=str,
+        default=None,
+        help="OpenClaw session key to wake (via `openclaw system event`) when this background job "
+             "finishes, instead of leaving the agent with no signal to check back. Pass your own "
+             "session key. Omit if not running under OpenClaw (e.g. Claude Code).",
+    )
+    ap.add_argument(
+        "--notify-profile",
+        type=str,
+        default=None,
+        help="OpenClaw --profile to use for the completion notification (e.g. 'unleashed' for Beast; "
+             "omit for Jensen's default profile). Only used with --notify-session.",
+    )
+    ap.add_argument(
         "--_worker",
         action="store_true",
         help=argparse.SUPPRESS,  # internal: runs the actual transcription synchronously
@@ -261,9 +276,13 @@ def main() -> None:
                 model=args.model,
                 verbatim=args.verbatim,
             )
-            _job_lock.mark_done(edit_dir, job_key, str(out_path))
+            _job_lock.mark_done(edit_dir, job_key, str(out_path),
+                                 session_key=args.notify_session, profile=args.notify_profile,
+                                 script_name="transcribe.py")
         except Exception as e:  # noqa: BLE001 -- must record failure, not crash silently
-            _job_lock.mark_failed(edit_dir, job_key, str(e))
+            _job_lock.mark_failed(edit_dir, job_key, str(e),
+                                   session_key=args.notify_session, profile=args.notify_profile,
+                                   script_name="transcribe.py")
             raise
         return
 
@@ -300,6 +319,10 @@ def main() -> None:
         worker_argv += ["--model", args.model]
     if args.verbatim:
         worker_argv += ["--verbatim"]
+    if args.notify_session:
+        worker_argv += ["--notify-session", args.notify_session]
+    if args.notify_profile:
+        worker_argv += ["--notify-profile", args.notify_profile]
 
     job = _job_lock.spawn_background_worker(edit_dir, job_key, worker_argv)
     print(

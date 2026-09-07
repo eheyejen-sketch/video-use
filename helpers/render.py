@@ -779,6 +779,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "starting one: RUNNING: / DONE: / FAILED: / NOT_FOUND:. Exit 0 unless failed/not_found.",
     )
     ap.add_argument(
+        "--notify-session",
+        type=str,
+        default=None,
+        help="OpenClaw session key to wake (via `openclaw system event`) when this background render "
+             "finishes, instead of leaving the agent with no signal to check back. Pass your own "
+             "session key. Omit if not running under OpenClaw (e.g. Claude Code).",
+    )
+    ap.add_argument(
+        "--notify-profile",
+        type=str,
+        default=None,
+        help="OpenClaw --profile to use for the completion notification (e.g. 'unleashed' for Beast; "
+             "omit for Jensen's default profile). Only used with --notify-session.",
+    )
+    ap.add_argument(
         "--_worker",
         action="store_true",
         help=argparse.SUPPRESS,  # internal: runs the actual render synchronously
@@ -873,12 +888,18 @@ def main() -> None:
         # reports the outcome into the lock file for --status to read.
         try:
             _run_render(args, edl_path, edit_dir, out_path)
-            _job_lock.mark_done(edit_dir, job_key, str(out_path))
+            _job_lock.mark_done(edit_dir, job_key, str(out_path),
+                                 session_key=args.notify_session, profile=args.notify_profile,
+                                 script_name="render.py")
         except SystemExit as e:
-            _job_lock.mark_failed(edit_dir, job_key, str(e.code))
+            _job_lock.mark_failed(edit_dir, job_key, str(e.code),
+                                   session_key=args.notify_session, profile=args.notify_profile,
+                                   script_name="render.py")
             raise
         except Exception as e:  # noqa: BLE001 -- must record failure, not crash silently
-            _job_lock.mark_failed(edit_dir, job_key, str(e))
+            _job_lock.mark_failed(edit_dir, job_key, str(e),
+                                   session_key=args.notify_session, profile=args.notify_profile,
+                                   script_name="render.py")
             raise
         return
 
@@ -912,6 +933,10 @@ def main() -> None:
         worker_argv.append("--no-loudnorm")
     if args.force:
         worker_argv.append("--force")
+    if args.notify_session:
+        worker_argv += ["--notify-session", args.notify_session]
+    if args.notify_profile:
+        worker_argv += ["--notify-profile", args.notify_profile]
 
     job = _job_lock.spawn_background_worker(edit_dir, job_key, worker_argv)
     print(

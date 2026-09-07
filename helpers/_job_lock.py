@@ -102,7 +102,32 @@ def spawn_background_worker(edit_dir: Path, job_key: str, worker_argv: list[str]
     return data
 
 
-def mark_done(edit_dir: Path, job_key: str, output_path: str) -> None:
+def notify_completion(session_key: str | None, profile: str | None, message: str) -> None:
+    """Best-effort wake-up of the OpenClaw session that launched this job, so
+    the agent resumes without waiting for the human to prompt it again.
+    Confirmed 2026-09-07: a background job finishing does not, by itself,
+    give the agent any signal to check back -- its own turn already ended
+    when it started the job. This closes that gap via `openclaw system
+    event`, which injects a message and wakes the session immediately
+    (`--mode now`) instead of waiting for the next heartbeat. Silently does
+    nothing if session_key is unset (e.g. Claude Code usage, which has no
+    OpenClaw session to notify) or if the CLI call fails for any reason --
+    a missed notification should never fail the job itself."""
+    if not session_key:
+        return
+    cmd = ["openclaw"]
+    if profile:
+        cmd += ["--profile", profile]
+    cmd += ["system", "event", "--session-key", session_key, "--text", message, "--mode", "now"]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=30)
+    except Exception:
+        pass  # best-effort only; never let a notification failure mask the real job result
+
+
+def mark_done(edit_dir: Path, job_key: str, output_path: str,
+               session_key: str | None = None, profile: str | None = None,
+               script_name: str = "job") -> None:
     lock_file = lock_path(edit_dir, job_key)
     data = read_lock(lock_file) or {}
     data.update({
@@ -112,9 +137,16 @@ def mark_done(edit_dir: Path, job_key: str, output_path: str) -> None:
         "error": None,
     })
     write_lock(lock_file, data)
+    notify_completion(
+        session_key, profile,
+        f"System notice: your background {script_name} ({job_key}) finished. "
+        f"Status: DONE. Output: {output_path}. Continue the video-use workflow from here.",
+    )
 
 
-def mark_failed(edit_dir: Path, job_key: str, error: str) -> None:
+def mark_failed(edit_dir: Path, job_key: str, error: str,
+                 session_key: str | None = None, profile: str | None = None,
+                 script_name: str = "job") -> None:
     lock_file = lock_path(edit_dir, job_key)
     data = read_lock(lock_file) or {}
     data.update({
@@ -123,6 +155,11 @@ def mark_failed(edit_dir: Path, job_key: str, error: str) -> None:
         "error": error,
     })
     write_lock(lock_file, data)
+    notify_completion(
+        session_key, profile,
+        f"System notice: your background {script_name} ({job_key}) failed. "
+        f"Error: {error}. Check what happened before retrying.",
+    )
 
 
 def print_status_line(edit_dir: Path, job_key: str, cached_output: Path | None = None) -> int:
