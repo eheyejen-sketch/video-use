@@ -239,6 +239,103 @@ def extract_segment(
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
+# -------- Cut validation against the real transcript ------------------------
+#
+# Added 2026-09-07 after a real incident: a proposed EDL's ranges were derived
+# by eyeballing a coarse summary of the transcript instead of computing gaps
+# programmatically, and two of the "silence gaps" it identified actually
+# contained real spoken words -- rendering as proposed would have silently
+# deleted sentences, not just dead air. This check makes that class of mistake
+# structurally impossible to render: it cross-checks every kept range and every
+# gap between kept ranges against the source's own word-level transcript, and
+# refuses to proceed if a cut would clip mid-word or skip over real speech.
+#
+# Padding tolerance matches Hard Rule 7 (30-200ms working window) -- a small
+# amount of a word's duration inside a "cut" gap is normal padding drift, not
+# a mistake. WORD_CLIP_TOLERANCE_S is deliberately generous (0.25s) so this
+# doesn't false-positive on intentional tight cuts.
+WORD_CLIP_TOLERANCE_S = 0.25
+
+
+def _load_transcript_words(edit_dir: Path, source_name: str) -> list[dict] | None:
+    path = edit_dir / "transcripts" / f"{source_name}.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return None
+    return [w for w in data.get("words", []) if w.get("type", "word") == "word"]
+
+
+def validate_cuts_against_transcripts(edl: dict, edit_dir: Path) -> list[str]:
+    """Returns a list of human-readable warnings. Empty list = clean."""
+    warnings: list[str] = []
+    ranges = edl.get("ranges", [])
+    by_source: dict[str, list[dict]] = {}
+    for r in ranges:
+        by_source.setdefault(r["source"], []).append(r)
+
+    for source_name, source_ranges in by_source.items():
+        words = _load_transcript_words(edit_dir, source_name)
+        if words is None:
+            warnings.append(
+                f"no cached transcript found for source '{source_name}' -- cuts for "
+                f"this source were NOT validated against real speech. If this source "
+                f"has spoken audio, transcribe it first so cuts can be checked."
+            )
+            continue
+
+        sorted_ranges = sorted(source_ranges, key=lambda r: r["start"])
+
+        # Check 1: does any kept range's start/end land mid-word?
+        for r in sorted_ranges:
+            for edge_name, edge_t in (("start", r["start"]), ("end", r["end"])):
+                for w in words:
+                    ws, we = w["start"], w["end"]
+                    if ws + WORD_CLIP_TOLERANCE_S < edge_t < we - WORD_CLIP_TOLERANCE_S:
+                        warnings.append(
+                            f"[{source_name}] range {edge_name} at {edge_t:.2f}s falls "
+                            f"mid-word inside \"{w['text']}\" ({ws:.2f}-{we:.2f}s) -- "
+                            f"this cut would clip a word, not land in silence."
+                        )
+
+        def _check_gap(gap_start: float, gap_end: float, label: str) -> None:
+            if gap_end <= gap_start:
+                return
+            skipped = [
+                w for w in words
+                if w["start"] >= gap_start - WORD_CLIP_TOLERANCE_S
+                and w["end"] <= gap_end + WORD_CLIP_TOLERANCE_S
+                and (w["end"] - w["start"]) > 0  # ignore zero-duration ASR artifacts
+                and min(w["end"], gap_end) - max(w["start"], gap_start) > WORD_CLIP_TOLERANCE_S
+            ]
+            if skipped:
+                quote = " ".join(w["text"] for w in skipped)
+                warnings.append(
+                    f"[{source_name}] {label} {gap_start:.2f}-{gap_end:.2f}s "
+                    f"is NOT silence -- it contains real speech that would be "
+                    f"deleted: \"{quote}\""
+                )
+
+        # Check 2: does the gap between consecutive kept ranges skip real words?
+        for a, b in zip(sorted_ranges, sorted_ranges[1:]):
+            _check_gap(a["end"], b["start"], "the gap between kept ranges")
+
+        # Check 3: does content get silently dropped before the first kept
+        # range, or after the last one? (the mistake that slipped past Check 2
+        # on 2026-09-07 -- a trailing "outro" cut that actually contained a
+        # full extra sentence, not just wind-down, with no second kept range
+        # after it for the between-ranges check to compare against)
+        if words:
+            transcript_start = min(w["start"] for w in words)
+            transcript_end = max(w["end"] for w in words)
+            _check_gap(transcript_start, sorted_ranges[0]["start"], "before the first kept range,")
+            _check_gap(sorted_ranges[-1]["end"], transcript_end, "after the last kept range,")
+
+    return warnings
+
+
 def extract_all_segments(
     edl: dict,
     edit_dir: Path,
@@ -660,6 +757,13 @@ def main() -> None:
         action="store_true",
         help="Skip audio loudness normalization. Default is on (-14 LUFS, -1 dBTP, LRA 11).",
     )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="Render even if cut validation finds a range that clips a word or "
+             "skips real speech. Use only after reviewing the warnings yourself "
+             "and confirming the cut is intentional.",
+    )
     args = ap.parse_args()
 
     edl_path = args.edl.resolve()
@@ -669,6 +773,22 @@ def main() -> None:
     edl = json.loads(edl_path.read_text())
     edit_dir = edl_path.parent
     out_path = args.output.resolve()
+
+    # 0. Validate cuts against the real transcript before doing any work.
+    # See validate_cuts_against_transcripts()'s docstring/comment for why this
+    # exists -- it catches cuts that would clip a word or delete real speech
+    # mistaken for silence, before anything renders.
+    cut_warnings = validate_cuts_against_transcripts(edl, edit_dir)
+    if cut_warnings:
+        print("CUT VALIDATION FAILED:")
+        for w in cut_warnings:
+            print(f"  - {w}")
+        if not args.force:
+            sys.exit(
+                "\nRefusing to render. Fix the EDL ranges above, or re-run with "
+                "--force if you have reviewed these and the cut is intentional."
+            )
+        print("\n--force set, rendering anyway despite the warnings above.\n")
 
     # 1. Extract per-segment (auto-grade per range if EDL grade is "auto")
     segment_paths = extract_all_segments(

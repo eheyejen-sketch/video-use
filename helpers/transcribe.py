@@ -57,11 +57,24 @@ def extract_audio(video_path: Path, dest: Path) -> None:
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+# Whisper normalizes out filler words ("um"/"uh") by default -- verified on a
+# real clip 2026-09-04 across both the turbo and large-v3 models. This exact
+# prompt, with --carry_initial_prompt so it applies to every internal decode
+# window (not just the first 30s), reliably surfaces them as real words with
+# timestamps instead. Only use --verbatim when a filler-removal pass is
+# actually wanted -- it changes nothing else about transcription quality/timing.
+VERBATIM_PROMPT = (
+    "Um, so, like, this is a verbatim transcript that includes every um, uh, "
+    "and filler word exactly as spoken, uh, without cleaning anything up."
+)
+
+
 def call_whisper(
     audio_path: Path,
     out_dir: Path,
     language: str | None = None,
     model: str = DEFAULT_MODEL,
+    verbatim: bool = False,
 ) -> dict:
     cmd = [
         WHISPER_BIN, str(audio_path),
@@ -74,6 +87,8 @@ def call_whisper(
     ]
     if language:
         cmd += ["--language", language]
+    if verbatim:
+        cmd += ["--initial_prompt", VERBATIM_PROMPT, "--carry_initial_prompt", "True"]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -115,19 +130,33 @@ def transcribe_one(
     num_speakers: int | None = None,  # unused: no diarization locally
     verbose: bool = True,
     model: str = DEFAULT_MODEL,
+    verbatim: bool = False,
 ) -> Path:
     """Transcribe a single video with local Whisper. Returns path to transcript JSON.
 
-    Cached: returns existing path immediately if the transcript already exists.
+    Cached: returns existing path immediately if it exists AND was produced with
+    the same `verbatim` mode being requested now (checked via a `"verbatim"` field
+    stored in the payload) -- one canonical file per source, not two, so
+    pack_transcripts.py's `*.json` glob never sees a duplicate for the same video.
+    Switching modes re-transcribes and overwrites.
+
+    `verbatim=True` primes Whisper to include filler words ("um"/"uh") that it
+    otherwise normalizes out by default -- use when a filler-removal cut is
+    actually wanted.
     """
     transcripts_dir = edit_dir / "transcripts"
     transcripts_dir.mkdir(parents=True, exist_ok=True)
     out_path = transcripts_dir / f"{video.stem}.json"
 
     if out_path.exists():
+        cached = json.loads(out_path.read_text())
+        if cached.get("verbatim", False) == verbatim:
+            if verbose:
+                print(f"cached: {out_path.name}")
+            return out_path
         if verbose:
-            print(f"cached: {out_path.name}")
-        return out_path
+            print(f"  cached transcript used verbatim={cached.get('verbatim', False)}, "
+                  f"requested verbatim={verbatim} -- re-transcribing")
 
     if verbose:
         print(f"  extracting audio from {video.name}", flush=True)
@@ -139,9 +168,11 @@ def transcribe_one(
         extract_audio(video, audio)
         size_mb = audio.stat().st_size / (1024 * 1024)
         if verbose:
-            print(f"  transcribing {video.stem}.wav ({size_mb:.1f} MB) with local whisper ({model})", flush=True)
-        raw = call_whisper(audio, tmp_path, language, model)
+            mode = " [verbatim]" if verbatim else ""
+            print(f"  transcribing {video.stem}.wav ({size_mb:.1f} MB) with local whisper ({model}){mode}", flush=True)
+        raw = call_whisper(audio, tmp_path, language, model, verbatim)
         payload = to_scribe_schema(raw)
+        payload["verbatim"] = verbatim
 
     out_path.write_text(json.dumps(payload, indent=2))
     dt = time.time() - t0
@@ -181,6 +212,12 @@ def main() -> None:
         default=DEFAULT_MODEL,
         help="Whisper model size (default: turbo)",
     )
+    ap.add_argument(
+        "--verbatim",
+        action="store_true",
+        help="Prime Whisper to include filler words (um/uh) it otherwise normalizes out. "
+             "Use before a filler-removal cut. Re-transcribes if the cached file used a different mode.",
+    )
     args = ap.parse_args()
 
     video = args.video.resolve()
@@ -195,6 +232,7 @@ def main() -> None:
         language=args.language,
         num_speakers=args.num_speakers,
         model=args.model,
+        verbatim=args.verbatim,
     )
 
 
