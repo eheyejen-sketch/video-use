@@ -24,9 +24,9 @@ These are the things where deviation produces silent failures or broken output. 
 3. **30ms audio fades at every segment boundary** (`afade=t=in:st=0:d=0.03,afade=t=out:st={dur-0.03}:d=0.03`). Otherwise audible pops at every cut.
 4. **Overlays use `setpts=PTS-STARTPTS+T/TB`** to shift the overlay's frame 0 to its window start. Otherwise you see the middle of the animation during the overlay window.
 5. **Master SRT uses output-timeline offsets**: `output_time = word.start - segment_start + segment_offset`. Otherwise captions misalign after segment concat.
-6. **Never cut inside a word.** Snap every cut edge to a word boundary from the transcript. **Never eyeball gaps from a coarse phrase-level summary — compute them from the raw per-word JSON, or trust `render.py`'s built-in validator to catch it** (added 2026-09-07 after a real incident: a cut derived by eyeballing `takes_packed.md`'s broad phrase groupings identified two "silence gaps" that actually contained real spoken sentences — one deleted "to create it on my system", the other deleted a full closing sentence. `render.py` now refuses to render any EDL where a kept-range boundary or a gap between ranges overlaps real speech in the source's transcript — it prints exactly what would be deleted and exits nonzero unless `--force` is passed. Don't route around this with `--force` without actually reading why it fired.)
+6. **Never cut inside a word.** Snap every cut edge to a word boundary from the transcript. **In the normal flow `pipeline.py` hands you the authoritative silence-gap table in `briefing.md` — cite gaps from there, never recompute them by reading the transcript. The EDL gate runs `render.py --validate-only` and will not let you render an EDL where a boundary clips a word or a between-ranges gap contains real speech; it prints exactly what would be deleted.** (Added 2026-09-07 after a real incident: a cut derived by eyeballing `takes_packed.md`'s broad phrase groupings identified two "silence gaps" that actually contained real spoken sentences — one deleted "to create it on my system", the other deleted a full closing sentence.) `render.py` keeps a `--force` for direct manual use after you've read the warnings; **`pipeline.py` never passes `--force` — fix the EDL instead.**
 7. **Pad every cut edge.** Working window: 30–200ms. Whisper word timestamps drift 50–100ms — padding absorbs the drift. Tighter for fast-paced, looser for cinematic.
-8. **Word-level verbatim ASR only.** Never SRT/phrase mode (loses sub-second gap data). Never normalized fillers (loses editorial signal) — `transcribe.py --verbatim` primes Whisper to include them; without it, "no filler words found" proves nothing. **Never assert a filler-word finding from your own reading of a transcript — run `check_fillers.py` and report exactly what it prints.** It refuses to answer (nonzero exit, no count printed) on a non-verbatim transcript instead of letting you report a false "none found." This isn't optional caution: two separate real incidents (2026-09-07) produced a confident but false "no fillers detected" claim from reading a non-verbatim transcript directly — the tool exists specifically because that mistake keeps recurring regardless of how clearly the rule is written down.
+8. **Word-level verbatim ASR only.** Never SRT/phrase mode (loses sub-second gap data). Never normalized fillers (loses editorial signal). **In the normal flow `pipeline.py` forces `transcribe.py --verbatim` and runs `check_fillers.py` for you — the result is in `briefing.md`'s filler report. That report is the ONLY basis for any filler-word statement. If it says `REFUSED` or is empty, you cannot claim anything about fillers.** `check_fillers.py` refuses (nonzero exit, no count) on a non-verbatim transcript rather than let you report a false "none found." This isn't optional caution: three real agent runs (2026-09-07 x2, 2026-09-08) produced a confident but false "no fillers detected" claim from reading a transcript directly — the whole driver exists because that mistake keeps recurring regardless of how clearly the rule is written down.
 9. **Cache transcripts per source.** Never re-transcribe unless the source file itself changed. Both `transcribe.py` and `render.py` now self-background and are safe to call repeatedly — see the Helpers section below.
 10. **Parallel sub-agents for multiple animations.** Never sequential. Spawn N at once via the `Agent` tool; total wall time ≈ slowest one.
 11. **Strategy confirmation before execution.** Never touch the cut until the user has approved the plain-English plan.
@@ -73,6 +73,10 @@ Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this
 
 ## Helpers
 
+**In a normal edit you drive everything through `pipeline.py` (see "The process" below) — it calls the helpers below in the enforced order. The reference here is for one-off debugging and for understanding what the driver does.**
+
+- **`pipeline.py init <video>… --edit-dir <dir>`** then **`pipeline.py <edit-dir>`** — the process driver. Owns step order across `INGEST → STRATEGY → EDL → RENDER → SELF_EVAL → DONE`; runs `transcribe.py --verbatim` / `pack_transcripts.py` / `check_fillers.py` / the gap analysis / `render.py` for you and refuses to let you skip a step or render an unvalidated EDL. `--status` reports the phase; `--confirm-strategy`, `--eval-verdict pass|fail`, `--restage edl|render` are the gates. Self-backgrounds via the same mechanism as `transcribe.py`/`render.py`; pass `--notify-session`/`--notify-profile` on `init` under OpenClaw.
+
 **`transcribe.py` and `render.py` self-background — you never need a background flag from the calling tool.** Every invocation returns almost immediately: the cache/lock is checked, a detached worker is spawned if needed, and the call exits. Poll with `--status` on the exact same command (same script, same args) until it prints `DONE:` or `FAILED:` — `RUNNING:` means keep waiting, `ALREADY_RUNNING:` means a prior call already started this exact job, don't launch another. This is deliberate and works identically in Claude Code's `Bash`, OpenClaw's `exec`, or a plain shell script — correctness does not depend on any caller-side background flag (confirmed 2026-09-07: relying on the calling tool's own flag was not reliable enough on its own — repeated blocking calls via OpenClaw's `exec` all died at the same ~2-minute mark before this fix). Calling either script again for the same job while it's still running is safe — it reports status instead of launching a duplicate whisper/ffmpeg process.
 
 **In OpenClaw (Jensen/Beast): pass `--notify-session <your session key>` (plus `--notify-profile` if you're Beast — see your SOUL.md) on every `transcribe.py`/`render.py` launch.** Without it, once a background job outlives your current turn, nothing tells you it finished — your turn already ended when you started it, and no new message arrives on its own (confirmed 2026-09-07: a completed transcription sat idle for minutes with no follow-up until this was added). With it, the script calls `openclaw system event` itself the moment the job finishes or fails, waking your session immediately so you can continue without Mike having to prompt you again. Claude Code doesn't need this — polling with `--status` in the same turn is fine there.
@@ -82,31 +86,67 @@ Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this
 - **`transcribe_batch.py <videos_dir>`** — 4-worker parallel transcription. Use for multi-take.
 - **`pack_transcripts.py --edit-dir <dir>`** — `transcripts/*.json` → `takes_packed.md` (phrase-level, break on silence ≥ 0.5s).
 - **`timeline_view.py <video> <start> <end>`** — filmstrip + waveform PNG. On-demand visual drill-down. **Not a scan tool** — use it at decision points, not constantly.
-- **`render.py <edl.json> -o <out>`** — validates every cut against the source's real transcript first (refuses to render and prints exactly what would be lost if a range clips a word or a gap contains real speech — see Hard Rule 6; `--force` overrides after you've actually reviewed why it fired), then per-segment extract → concat → background matte (if EDL has `"background"`) → overlays (PTS-shifted) → subtitles LAST. `--preview` for 720p fast. `--build-subtitles` to generate master.srt inline. `--no-matte` to skip background swap. Add `--status` (same `edl`/`-o` args) to poll a background render instead of starting one.
+- **`render.py <edl.json> -o <out>`** — validates every cut against the source's real transcript first (refuses to render and prints exactly what would be lost if a range clips a word or a gap contains real speech — see Hard Rule 6; `--force` overrides after you've actually reviewed why it fired), then per-segment extract → concat → background matte (if EDL has `"background"`) → overlays (PTS-shifted) → subtitles LAST. `--preview` for 720p fast. `--build-subtitles` to generate master.srt inline. `--no-matte` to skip background swap. Add `--status` (same `edl`/`-o` args) to poll a background render instead of starting one. **`--validate-only <edl.json>`** runs just the cut-vs-transcript check and exits 0/1 (no `-o` needed) — this is what `pipeline.py`'s EDL gate calls.
 - **`grade.py <in> -o <out>`** — ffmpeg filter chain grade. Presets + `--filter '<raw>'` for custom. `warm_cinematic`/sky-boost style grades are rejected for this account, including Beachcrewzr — don't use, default to `none`.
 - **`matte.py <in> -o <out> --bg <image>`** — replace the background behind a person (RVM, no green screen). Own venv (`.matte-venv`). Invoked automatically by `render.py` when the EDL has `"background"` — you usually don't call this directly.
 - **`build_icon_overlay.py --icon <name> --label <text> --color R,G,B -o <out.mov>`** — build a single icon+label badge overlay (ProRes 4444, real alpha) from the local Tabler icon library (`~/Developer/tabler-icons`, MIT licensed, 6,000+ icons — see that repo's own README for the full catalog, or `--list-icons '<pattern>'` to search). Same visual style as the launch video's overlays. Use `rsvg-convert` for any other SVG rasterization — ImageMagick's built-in SVG delegate produces a 1-bit bitmap with no anti-aliasing, verified broken 2026-09-04.
 
 For animations beyond a simple icon badge, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a sub-agent via the `Agent` tool.
 
-## The process
+## The process — driven by `pipeline.py`
 
-1. **Inventory.** `ffprobe` every source. `transcribe_batch.py` on the directory. `pack_transcripts.py` to produce `takes_packed.md`. Sample one or two `timeline_view`s for a visual first impression.
-2. **Pre-scan for problems.** One pass over `takes_packed.md` to note verbal slips, obvious mis-speaks, or phrasings to avoid. Plain list, feed into the editor brief.
-3. **Converse.** Describe what you see in plain English. Ask questions *shaped by the material*. Collect: content type, target length/aspect, aesthetic/brand direction, pacing feel, must-preserve moments, must-cut moments, animation and grade preferences, subtitle needs. Do not use a fixed checklist — the right questions are different every time.
-4. **Propose strategy.** 4–8 sentences: shape, take choices, cut direction, animation plan, grade direction, subtitle style, length estimate. **Wait for confirmation.**
-5. **Execute.** Produce `edl.json` via the editor sub-agent brief. Drill into `timeline_view` at ambiguous moments. Build animations in parallel sub-agents. Apply grade per-segment. Compose via `render.py`.
-6. **Preview.** `render.py --preview`.
-7. **Self-eval (before showing the user).** Run `timeline_view` on the **rendered output** (not the sources) at every cut boundary (±1.5s window). Check each image for:
-   - Visual discontinuity / flash / jump at the cut
-   - Waveform spike at the boundary (audio pop that slipped past the 30ms fade)
-   - Subtitle hidden behind an overlay (Rule 1 violation)
-   - Overlay misaligned or showing wrong frames (Rule 4 violation)
+**`helpers/pipeline.py` owns the step order. You do not call `transcribe.py`,
+`transcribe_batch.py`, `pack_transcripts.py`, `check_fillers.py`, or `render.py`
+yourself during a normal edit — the driver runs them, in order, and won't let you
+skip ahead.** (Call them directly only for one-off debugging.) It is a state machine:
 
-   Also sample: first 2s, last 2s, and 2–3 mid-points — check grade consistency, subtitle readability, overall coherence. Run `ffprobe` on the output to verify duration matches the EDL expectation.
+```
+INGEST → STRATEGY → EDL → RENDER → SELF_EVAL → DONE
+```
 
-   If anything fails: fix → re-render → re-eval. **Cap at 3 self-eval passes** — if issues remain after 3, flag them to the user rather than looping forever. Only present the preview once the self-eval passes.
-8. **Iterate + persist.** Natural-language feedback, re-plan, re-render. Never re-transcribe. Final render on confirmation. Append to `project.md`.
+State lives in `<edit>/pipeline_state.json`. Every call is re-entrant and returns
+fast; the slow steps (transcribe, render) self-background and wake you when done.
+
+| Command | Phase | The driver does (no choice for you) | You owe back |
+|---|---|---|---|
+| `pipeline.py init <video>… --edit-dir <dir> [--notify-session K --notify-profile P]` | — | create state | — |
+| `pipeline.py <dir>` | INGEST | ffprobe → `transcribe.py --verbatim` → `pack_transcripts.py` → `check_fillers.py` → silence-gap table → **`briefing.md`** + 2 sample frames | read `briefing.md`, converse with the user |
+| `pipeline.py <dir> --confirm-strategy` | STRATEGY | check `strategy.md` exists, is substantive, has a `## User confirmation` quote | write `strategy.md` (4–8 sentences + the confirmation section) |
+| `pipeline.py <dir>` | EDL | schema-check `edl.json`; run `render.py --validate-only` (cut-vs-speech); refuse on any failure, no `--force` | write `edl.json` per **EDL format** below |
+| `pipeline.py <dir>` | RENDER | `render.py … --build-subtitles` | nothing — wait |
+| `pipeline.py <dir>` | SELF_EVAL | extract `timeline_view` frames of the **rendered output** at every cut (±1.5s) + head/tail/mids; check duration vs EDL | inspect every `eval/*.png` (see checklist), then `--eval-verdict pass` or `--eval-verdict fail --restage edl\|render` (cap 3 fails) |
+| `pipeline.py <dir> --eval-verdict pass` | → DONE | append the session block to `project.md` | — |
+
+`pipeline.py <dir> --status` prints the current phase and exactly what's owed.
+`pipeline.py <dir> --restage edl\|render` steps back manually.
+
+**Your part is only the subjective work:** what the material is and what to ask the
+user (INGEST), the cut strategy (STRATEGY), the take/cut selection in the EDL and any
+animations (EDL), and the visual judgement on the eval frames (SELF_EVAL). The
+driver owns correctness; you own taste.
+
+**Self-eval frame checklist** (what to look for in each `eval/*.png`):
+- visual discontinuity / flash / jump at the cut
+- waveform spike at the boundary (audio pop past the 30 ms fade)
+- subtitle hidden behind an overlay (Rule 1 violation)
+- overlay misaligned or showing wrong frames (Rule 4 violation)
+- grade consistency, subtitle readability, overall coherence (head/tail/mid frames)
+
+## If the pipeline refuses
+
+- **`WAITING: …`** — a background job (transcription or render) is still running.
+  You'll be notified when it finishes; then re-run `pipeline.py <dir>`. Nothing is wrong.
+- **`REFUSED: … strategy.md …`** — write a real `strategy.md` with a `## User
+  confirmation` section quoting the user's plain-English approval. The pipeline will
+  not cut without recorded confirmation.
+- **`EDL SCHEMA INVALID:`** — fix the listed structural problems in `edl.json`
+  (missing fields, bad paths, start ≥ end, range past source duration).
+- **`CUT VALIDATION FAILED:`** — a range boundary clips a word, or a gap between kept
+  ranges contains real speech. The message quotes exactly what would be deleted. Move
+  the boundary to a real silence (see `briefing.md`'s gap table). Do **not** reach for
+  `render.py --force` — the pipeline doesn't use it and neither should you here.
+- **`INGEST FAILED: …`** — transcription failed or produced a non-verbatim file.
+  Check `<edit>/jobs/*.log`.
 
 ## Cut craft (techniques)
 
@@ -286,6 +326,10 @@ Match the source unless the user asked for something specific. Common targets: `
     {"source": "C0108", "start": 14.30, "end": 28.90,
      "beat": "SOLUTION", "quote": "...", "reason": "Only take without the false start."}
   ],
+  "omissions": [
+    {"source": "C0103", "start": 6.85, "end": 14.30,
+     "reason": "repeated take of the same beat — kept the C0108 version"}
+  ],
   "grade": "warm_cinematic",
   "overlays": [
     {"file": "edit/animations/slot_1/render.mp4", "start_in_output": 0.0, "duration": 5.0}
@@ -296,6 +340,8 @@ Match the source unless the user asked for something specific. Common targets: `
 ```
 
 `grade` is a preset name or raw ffmpeg filter. `overlays` are rendered animation clips. `subtitles` is optional and applied LAST.
+
+**`omissions`** — every span of *speech* your edit removes (the gap between two kept ranges, or speech before the first / after the last range) must be listed here with a `reason`, or the EDL gate rejects it as `UNDECLARED SPEECH REMOVAL`. This is deliberate: the 2026-09-07 incident deleted real sentences the editor believed were silence. Declaring `{source, start, end, reason}` forces you to have looked at what you're cutting. A pure trim with one continuous range needs no `omissions`. `render.py --force` also bypasses the check for direct manual use — but `pipeline.py` never uses it; declare instead.
 
 ## Memory — `project.md`
 

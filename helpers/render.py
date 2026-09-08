@@ -272,8 +272,54 @@ def _load_transcript_words(edit_dir: Path, source_name: str) -> list[dict] | Non
     return [w for w in data.get("words", []) if w.get("type", "word") == "word"]
 
 
+def _classify_cut_warning(msg: str) -> dict:
+    """Turn one validate_cuts_against_transcripts() string into a structured
+    record for `--validate-only --json`. Kinds: 'clip' (a range boundary lands
+    mid-word -- never acceptable), 'speech_gap' (a between-ranges / head / tail
+    span that removes real speech -- acceptable only if the EDL declares it in
+    `omissions`), 'no_transcript' (a source wasn't transcribed), 'other'."""
+    src_m = re.match(r"^\[([^\]]+)\]\s*", msg)
+    source = src_m.group(1) if src_m else None
+    if "falls mid-word" in msg:
+        t_m = re.search(r"at ([\d.]+)s falls mid-word", msg)
+        t = float(t_m.group(1)) if t_m else None
+        return {"kind": "clip", "source": source, "start": t, "end": t, "message": msg}
+    if "is NOT silence" in msg:
+        g_m = re.search(r"([\d.]+)-([\d.]+)s is NOT silence", msg)
+        a = float(g_m.group(1)) if g_m else None
+        b = float(g_m.group(2)) if g_m else None
+        return {"kind": "speech_gap", "source": source, "start": a, "end": b, "message": msg}
+    if "no cached transcript found" in msg:
+        n_m = re.search(r"source '([^']+)'", msg)
+        return {"kind": "no_transcript", "source": n_m.group(1) if n_m else source,
+                "start": None, "end": None, "message": msg}
+    return {"kind": "other", "source": source, "start": None, "end": None, "message": msg}
+
+
+def _declared_omission(edl: dict, source: str, start: float, end: float) -> bool:
+    """True if the EDL's `omissions` array explicitly covers [start,end] for
+    this source with a non-empty reason. A declared omission is the editor
+    saying 'I know there is speech here and I am cutting it on purpose' -- it
+    suppresses the removed-speech warning for that span (but never a mid-word
+    clip). This is what lets `pipeline.py` run without ever passing --force."""
+    for o in edl.get("omissions", []) or []:
+        try:
+            if (o.get("source") == source
+                    and str(o.get("reason", "")).strip()
+                    and float(o["start"]) <= start + WORD_CLIP_TOLERANCE_S
+                    and float(o["end"]) >= end - WORD_CLIP_TOLERANCE_S):
+                return True
+        except (KeyError, TypeError, ValueError):
+            continue
+    return False
+
+
 def validate_cuts_against_transcripts(edl: dict, edit_dir: Path) -> list[str]:
-    """Returns a list of human-readable warnings. Empty list = clean."""
+    """Returns a list of human-readable warnings. Empty list = clean.
+
+    A removed-speech span listed in the EDL's `omissions` (with a reason) is
+    treated as intentional and not warned about. Mid-word clips are always
+    warned regardless of `omissions`."""
     warnings: list[str] = []
     ranges = edl.get("ranges", [])
     by_source: dict[str, list[dict]] = {}
@@ -314,7 +360,7 @@ def validate_cuts_against_transcripts(edl: dict, edit_dir: Path) -> list[str]:
                 and (w["end"] - w["start"]) > 0  # ignore zero-duration ASR artifacts
                 and min(w["end"], gap_end) - max(w["start"], gap_start) > WORD_CLIP_TOLERANCE_S
             ]
-            if skipped:
+            if skipped and not _declared_omission(edl, source_name, gap_start, gap_end):
                 quote = " ".join(w["text"] for w in skipped)
                 warnings.append(
                     f"[{source_name}] {label} {gap_start:.2f}-{gap_end:.2f}s "
@@ -734,7 +780,23 @@ def _job_key(out_path: Path) -> str:
 def _build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Render a video from an EDL")
     ap.add_argument("edl", type=Path, help="Path to edl.json")
-    ap.add_argument("-o", "--output", type=Path, required=True, help="Output video path")
+    ap.add_argument("-o", "--output", type=Path, default=None,
+                    help="Output video path (required unless --validate-only)")
+    ap.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Run only the cut-vs-transcript validation and exit: prints the same "
+             "CUT VALIDATION FAILED report render would print, exit 0 if clean / 1 if "
+             "any range clips a word or a gap contains real speech. Renders nothing, "
+             "needs no -o. This is what pipeline.py's EDL gate calls.",
+    )
+    ap.add_argument(
+        "--json",
+        action="store_true",
+        help="With --validate-only: emit the warnings as a JSON array of "
+             "{kind: clip|speech_gap|no_transcript, source, start, end, message} "
+             "instead of the text report. pipeline.py's EDL gate consumes this.",
+    )
     ap.add_argument(
         "--preview",
         action="store_true",
@@ -877,6 +939,36 @@ def main() -> None:
         sys.exit(f"edl not found: {edl_path}")
 
     edit_dir = edl_path.parent
+
+    if args.validate_only:
+        # Cut-vs-transcript check only. Renders nothing, needs no -o. Same report
+        # body as the pre-render gate in _run_render(), but as a standalone exit
+        # code so pipeline.py's EDL gate can block on it. With --json, classify
+        # each warning so the gate can treat mid-word clips (never allowed) apart
+        # from removed-speech gaps (allowed if the EDL declares them).
+        try:
+            edl = json.loads(edl_path.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            if args.json:
+                print(json.dumps([{"kind": "parse_error", "source": None,
+                                   "start": None, "end": None, "message": str(e)}]))
+            else:
+                print(f"CUT VALIDATION FAILED:\n  - could not read EDL: {e}")
+            sys.exit(1)
+        cut_warnings = validate_cuts_against_transcripts(edl, edit_dir)
+        if args.json:
+            print(json.dumps([_classify_cut_warning(w) for w in cut_warnings]))
+            sys.exit(1 if cut_warnings else 0)
+        if cut_warnings:
+            print("CUT VALIDATION FAILED:")
+            for w in cut_warnings:
+                print(f"  - {w}")
+            sys.exit(1)
+        print("CUT VALIDATION OK: no range clips a word, no gap contains real speech.")
+        sys.exit(0)
+
+    if args.output is None:
+        sys.exit("render.py: -o/--output is required unless --validate-only is set")
     out_path = args.output.resolve()
     job_key = _job_key(out_path)
 
