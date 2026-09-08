@@ -111,6 +111,14 @@ long edit fills an agent's context with transcript + briefing + render output; i
 you hit "prompt too large", reset the session and re-run `pipeline.py <edit-dir>`,
 which resumes at the saved phase (nothing re-transcribed or re-rendered).
 
+**When a background job wakes you, or whenever you're unsure what's next: the only
+action is `pipeline.py <edit-dir>` (or `--status`).** Do not read `transcripts/*.json`
+or other edit-dir files directly and do not analyze the video or estimate filler
+counts yourself — everything you reason from comes from `briefing.md`, which the
+pipeline writes at the end of INGEST. No `briefing.md` yet means INGEST isn't
+finished; run `pipeline.py <edit-dir>` again. (2026-09-08: a woken agent read the
+raw transcript and posted "~15 uhs" instead of advancing — `check_fillers.py` never ran.)
+
 | Command | Phase | The driver does (no choice for you) | You owe back |
 |---|---|---|---|
 | `pipeline.py init <video>… [--notify-session K --notify-profile P]` | — | create `<video_parent>/edit/` + state; prints the path (don't pass `--edit-dir`) | — |

@@ -188,8 +188,10 @@ def mark_done(edit_dir: Path, job_key: str, output_path: str,
     write_lock(lock_file, data)
     notify_completion(
         session_key, profile,
-        f"System notice: your background {script_name} ({job_key}) finished. "
-        f"Status: DONE. Output: {output_path}. Continue the video-use workflow from here.",
+        f"System notice: background {script_name} ({job_key}) finished OK. "
+        f"YOUR ONLY NEXT ACTION: run  pipeline.py {edit_dir}  to advance the "
+        f"video-use pipeline. Do NOT read transcripts/*.json or analyze anything "
+        f"directly — the pipeline hands you briefing.md when INGEST is done.",
     )
 
 
@@ -206,8 +208,9 @@ def mark_failed(edit_dir: Path, job_key: str, error: str,
     write_lock(lock_file, data)
     notify_completion(
         session_key, profile,
-        f"System notice: your background {script_name} ({job_key}) failed. "
-        f"Error: {error}. Check what happened before retrying.",
+        f"System notice: background {script_name} ({job_key}) FAILED: {error}. "
+        f"Run  pipeline.py {edit_dir} --status  and read {edit_dir}/jobs/{job_key}.log "
+        f"before retrying. Do not work around it by analyzing files directly.",
     )
 
 

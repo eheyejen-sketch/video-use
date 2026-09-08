@@ -146,3 +146,21 @@ background swap / grade actually took effect"), "If the pipeline refuses" entry.
   `<first-video-parent>/edit`, OR default it and have SOUL.md say "don't pass --edit-dir".
 - Mechanics verified good: --verbatim forced, --notify-session + --notify-profile
   unleashed present, pipeline-driven. INGEST transcription running.
+
+## Beast re-run #2 — the wake→freelance gap (2026-09-08 13:27)
+
+- `[notify] system event sent` confirmed in the transcribe log — **fix #1's auth
+  fix works** (first successful notify from a worker). Whether the event vs a
+  heartbeat woke Beast: unconfirmed (2-min gap fits either).
+- **New failure:** the woken Beast did NOT run `pipeline.py <edit-dir>` to finish
+  INGEST. It read `transcripts/IMG_4328.json` directly and posted a freeform
+  analysis with EYEBALLED fillers ("~15 uhs, ~5 ums", "roughly one every 3-4s").
+  Phase stuck at INGEST; briefing.md/filler_report.txt never generated;
+  `check_fillers.py`'s real count never ran. The pre-driver pattern, re-emerging
+  in the gap between "wake" and "re-enter the pipeline".
+- FIXED: `_job_lock.mark_done`/`mark_failed` messages rewritten to an explicit
+  command — "YOUR ONLY NEXT ACTION: run pipeline.py <edit_dir> ... Do NOT read
+  transcripts/*.json or analyze anything directly." SKILL.md (canonical + scoped)
+  "The process" gained a paragraph: when woken or unsure, the only action is
+  `pipeline.py <edit-dir>`; reason only from briefing.md; no briefing.md = INGEST
+  not done.
