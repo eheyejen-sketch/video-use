@@ -47,12 +47,27 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 HELPERS = Path(__file__).resolve().parent
+
+# Run under the project venv no matter how we were invoked. Some agents' `exec`
+# does not honour this file's shebang and starts it with the macOS system
+# python 3.9 (no numpy/PIL/etc) -- then every `run_helper` child inherits that
+# via sys.executable and timeline_view.py / render.py crash on missing deps.
+# Re-exec once under .venv/bin/python3 so the whole pipeline is consistent.
+_VENV_PY = HELPERS.parent / ".venv" / "bin" / "python3"
+if _VENV_PY.exists() and not os.environ.get("_VIDEO_USE_VENV_REEXEC"):
+    try:
+        if Path(sys.executable).resolve() != _VENV_PY.resolve():
+            os.environ["_VIDEO_USE_VENV_REEXEC"] = "1"
+            os.execv(str(_VENV_PY), [str(_VENV_PY), str(Path(__file__).resolve()), *sys.argv[1:]])
+    except OSError:
+        pass  # fall through and hope the current interpreter has what's needed
 STATE_NAME = "pipeline_state.json"
 PHASES = ["INGEST", "STRATEGY", "EDL", "RENDER", "SELF_EVAL", "DONE"]
 

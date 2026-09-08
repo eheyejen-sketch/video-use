@@ -365,3 +365,21 @@ NOTE: Jensen's IN-FLIGHT transcribe worker (launched 17:36 with the old _job_loc
 memory) still has the broken notify — it may stall after transcription like Beast's
 early runs. The fix applies to its RENDER worker + all future runs.
 Stray `~/.openclaw-jensen/` dir left by the bad flag — safe to `rm -rf` (cosmetic).
+
+## Jensen run — scripts ran under system python 3.9, not the venv (2026-09-08 ~17:50)
+
+Jensen's `exec` did NOT honour `pipeline.py`'s shebang — it started the driver with
+macOS `/Library/Developer/CommandLineTools/.../python3.9` (no numpy/PIL/torch), and
+every `run_helper` child inherited that via `sys.executable`. `transcribe.py` limped
+(it shells out to the `whisper` CLI + ffmpeg, mostly stdlib) but `timeline_view.py`
+(numpy + PIL) — used in SELF_EVAL — would crash, and possibly render.
+
+Fixed (class): `pipeline.py` re-execs itself under `<repo>/.venv/bin/python3` at
+startup if `sys.executable` isn't it (guarded by `_VIDEO_USE_VENV_REEXEC` env to
+prevent loops). Since the driver spawns every helper with `sys.executable`, one
+re-exec makes the whole pipeline consistent regardless of how the agent's exec
+launched it. Verified: `system-python3.9 pipeline.py` → re-execs under venv; venv
+direct → no loop.
+
+Jensen's in-flight transcribe (already running under 3.9) will limp to completion;
+its next `pipeline.py <dir>` call re-execs correctly and the rest of the run is fine.
