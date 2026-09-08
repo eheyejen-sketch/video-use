@@ -48,6 +48,16 @@ except Exception:
     def auto_grade_for_clip(video, start=0.0, duration=None, verbose=False):  # type: ignore
         return "eq=contrast=1.03:saturation=0.98", {}
 
+try:
+    from check_fillers import FILLER_WORDS, _normalize as _norm_word  # same directory
+except Exception:  # keep validation working even if check_fillers moves
+    FILLER_WORDS = {"um", "umm", "uhm", "uh", "uhh", "er", "erm", "ah", "hmm", "mm"}
+    _re_word = re.compile(r"[a-z']+")
+
+    def _norm_word(text: str) -> str:
+        m = _re_word.search(text.lower())
+        return m.group(0) if m else ""
+
 
 # The default Homebrew ffmpeg formula is built without libass or libzimg, so
 # neither the `subtitles` filter nor `zscale` (used by TONEMAP_CHAIN for HDR
@@ -360,7 +370,15 @@ def validate_cuts_against_transcripts(edl: dict, edit_dir: Path) -> list[str]:
                 and (w["end"] - w["start"]) > 0  # ignore zero-duration ASR artifacts
                 and min(w["end"], gap_end) - max(w["start"], gap_start) > WORD_CLIP_TOLERANCE_S
             ]
-            if skipped and not _declared_omission(edl, source_name, gap_start, gap_end):
+            if not skipped:
+                return
+            # Removing a gap that contains ONLY filler words (um/uh/...) is the
+            # normal business of a filler-removal edit -- don't force an
+            # `omissions` entry for each of 15+ of them. Any real word in the
+            # gap still warns (that's genuine speech being deleted).
+            if all(_norm_word(w.get("text", "")) in FILLER_WORDS for w in skipped):
+                return
+            if not _declared_omission(edl, source_name, gap_start, gap_end):
                 quote = " ".join(w["text"] for w in skipped)
                 warnings.append(
                     f"[{source_name}] {label} {gap_start:.2f}-{gap_end:.2f}s "

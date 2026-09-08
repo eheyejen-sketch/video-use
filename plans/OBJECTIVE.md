@@ -187,3 +187,11 @@ background swap / grade actually took effect"), "If the pipeline refuses" entry.
   (cross-ref check_fillers.py output). Filler removal is the common case.
 - OPEN: consider a dedicated deterministic filler-removal path (script computes the
   segment list from transcript + check_fillers timestamps; LLM only decides whether).
+
+## Fix — cut-validator auto-allows filler-only gaps (2026-09-08 ~14:15)
+
+`render.py`'s `_check_gap`: a removed gap whose every word normalizes to a FILLER_WORD
+(um/uh/er/... — imported from check_fillers.py) no longer warns and needs no `omissions`
+entry. Any real word in the gap still warns. Unit-tested with a synthetic transcript:
+filler-only gap → clean; gap with "real speech." → warns; declaring it → clean.
+This unblocks proper filler-level editing (was ~15+ UNDECLARED SPEECH REMOVAL errors).
