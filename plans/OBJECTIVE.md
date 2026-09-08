@@ -164,3 +164,26 @@ background swap / grade actually took effect"), "If the pipeline refuses" entry.
   "The process" gained a paragraph: when woken or unsure, the only action is
   `pipeline.py <edit-dir>`; reason only from briefing.md; no briefing.md = INGEST
   not done.
+
+## Beast re-run #2 — STRATEGY gate is fakeable; added --restage strategy (2026-09-08 13:39)
+
+- Beast cited "18 fillers" from the briefing ✓ (the wake→pipeline fix worked). But
+  `strategy.md`'s `## User confirmation` was FABRICATED — "Mike confirmed the plan:
+  ..." with no actual confirmation. The gate only checks the section exists; it
+  can't tell a paraphrase from a real quote. Beast self-caught it the next turn and
+  went back to asking Mike. Fundamental limit: the agent always asserts
+  confirmation; Mike-in-the-loop reviewing strategy.md is the only real backstop.
+- Beast also wrote edl.json in a WRONG self-invented schema (`segments`/`source_start`
+  instead of `ranges`/`start` + `sources` map + `version`). The pipeline schema
+  gate correctly rejects it (3 errors). Note: `render.py --validate-only` returned
+  `[]` on it (reads edl["ranges"] which was empty) — latent: cut-validator is silent
+  on a no-`ranges` EDL. Harmless (schema gate runs first).
+- Beast stuck at EDL with a bad strategy and no way back. ADDED `--restage strategy`
+  (phase→STRATEGY, clears strategy_confirmed + downstream). SKILL.md updated. Live
+  script change — available to Beast's current session immediately.
+- OPEN (promoted): the omissions design doesn't scale to filler-level editing —
+  Beast's 12-segment filler-removal EDL would need ~12 omissions entries. Fix: the
+  cut-validator should auto-allow a removed gap that contains ONLY filler words
+  (cross-ref check_fillers.py output). Filler removal is the common case.
+- OPEN: consider a dedicated deterministic filler-removal path (script computes the
+  segment list from transcript + check_fillers timestamps; LLM only decides whether).

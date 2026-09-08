@@ -75,7 +75,7 @@ Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this
 
 **In a normal edit you drive everything through `pipeline.py` (see "The process" below) — it calls the helpers below in the enforced order. The reference here is for one-off debugging and for understanding what the driver does.**
 
-- **`pipeline.py init <video>…`** then **`pipeline.py <edit-dir>`** — the process driver. `init` creates the edit folder **next to the source video** (`<video_parent>/edit/`) and prints its path; **do not pass `--edit-dir`** — any value that isn't the canonical path is ignored. Use the printed path for every later call. Owns step order across `INGEST → STRATEGY → EDL → RENDER → SELF_EVAL → DONE`; runs `transcribe.py --verbatim` / `pack_transcripts.py` / `check_fillers.py` / the gap analysis / `render.py` for you and refuses to let you skip a step or render an unvalidated EDL. `--status` reports the phase; `--confirm-strategy`, `--eval-verdict pass|fail`, `--restage edl|render` are the gates. Self-backgrounds; pass `--notify-session`/`--notify-profile` on `init` under OpenClaw.
+- **`pipeline.py init <video>…`** then **`pipeline.py <edit-dir>`** — the process driver. `init` creates the edit folder **next to the source video** (`<video_parent>/edit/`) and prints its path; **do not pass `--edit-dir`** — any value that isn't the canonical path is ignored. Use the printed path for every later call. Owns step order across `INGEST → STRATEGY → EDL → RENDER → SELF_EVAL → DONE`; runs `transcribe.py --verbatim` / `pack_transcripts.py` / `check_fillers.py` / the gap analysis / `render.py` for you and refuses to let you skip a step or render an unvalidated EDL. `--status` reports the phase; `--confirm-strategy`, `--eval-verdict pass|fail`, `--restage strategy|edl|render` are the gates. Self-backgrounds; pass `--notify-session`/`--notify-profile` on `init` under OpenClaw.
 
 **`transcribe.py` and `render.py` self-background — you never need a background flag from the calling tool.** Every invocation returns almost immediately: the cache/lock is checked, a detached worker is spawned if needed, and the call exits. Poll with `--status` on the exact same command (same script, same args) until it prints `DONE:` or `FAILED:` — `RUNNING:` means keep waiting, `ALREADY_RUNNING:` means a prior call already started this exact job, don't launch another. This is deliberate and works identically in Claude Code's `Bash`, OpenClaw's `exec`, or a plain shell script — correctness does not depend on any caller-side background flag (confirmed 2026-09-07: relying on the calling tool's own flag was not reliable enough on its own — repeated blocking calls via OpenClaw's `exec` all died at the same ~2-minute mark before this fix). Calling either script again for the same job while it's still running is safe — it reports status instead of launching a duplicate whisper/ffmpeg process.
 
@@ -130,7 +130,7 @@ raw transcript and posted "~15 uhs" instead of advancing — `check_fillers.py` 
 | `pipeline.py <dir> --eval-verdict pass` | → DONE | append the session block to `project.md` | — |
 
 `pipeline.py <dir> --status` prints the current phase and exactly what's owed.
-`pipeline.py <dir> --restage edl\|render` steps back manually.
+`pipeline.py <dir> --restage strategy\|edl\|render` steps back manually (`strategy` = rewrite strategy.md and re-confirm).
 
 **Your part is only the subjective work:** what the material is and what to ask the
 user (INGEST), the cut strategy (STRATEGY), the take/cut selection in the EDL and any

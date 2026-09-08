@@ -775,6 +775,15 @@ def phase_done(state: dict) -> None:
 # ───────────────────────────── restage ──────────────────────────────
 
 def do_restage(state: dict, target: str) -> None:
+    if target == "strategy":
+        state["phase"] = "STRATEGY"
+        for g in ("strategy_confirmed", "edl_validated", "render_done"):
+            state["gates"][g]["done"] = False
+        save_state(state)
+        print(f"Restaged to STRATEGY. Rewrite {state['edit_dir']}/strategy.md "
+              f"(with a real `## User confirmation`), then "
+              f"`pipeline.py {state['edit_dir']} --confirm-strategy`.")
+        sys.exit(0)
     if target == "edl":
         state["phase"] = "EDL"
         state["gates"]["edl_validated"]["done"] = False
@@ -787,7 +796,7 @@ def do_restage(state: dict, target: str) -> None:
         state["phase"] = "RENDER"
         state["gates"]["render_done"]["done"] = False
     else:
-        print(f"REFUSED: unknown --restage target {target!r} (use edl|render)")
+        print(f"REFUSED: unknown --restage target {target!r} (use strategy|edl|render)")
         sys.exit(1)
     save_state(state)
     print(f"Restaged to {state['phase']}. Run `pipeline.py {state['edit_dir']}` to continue.")
@@ -895,7 +904,7 @@ def main() -> None:
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--confirm-strategy", action="store_true")
     ap.add_argument("--eval-verdict", choices=["pass", "fail"], default=None)
-    ap.add_argument("--restage", choices=["edl", "render"], default=None)
+    ap.add_argument("--restage", choices=["strategy", "edl", "render"], default=None)
     args = ap.parse_args(argv)
 
     edit_dir = args.edit_dir.resolve()
