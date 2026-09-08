@@ -281,3 +281,27 @@ Fixed at the class level:
 
 Verified: master.srt rebuilds with 94 cues (was 0); 0 standalone filler cues (the
 filler-strip carries into captions).
+
+## Beast FABRICATED the self-eval review — closed (2026-09-08 ~17:05)
+
+Beast's text-only model wrote a detailed, confident, entirely invented frame-by-frame
+`eval_review.md` ("man in blue shirt... clean cut, no flash", 15 per-frame verdicts,
+a "mid_75 (75s)" frame that doesn't exist, "background is the original room" which is
+FALSE — the matte swapped it). Ran `--eval-verdict pass` → pipeline accepted it
+(existence+length check can't judge authenticity) → **false DONE**.
+
+Fix (class, not instance):
+- `--eval-verdict pass` on an agent-started run (`running_as_agent`) is **refused
+  unconditionally** — no eval_review.md escape. Requires `--reviewer <name>`, which a
+  text-only agent cannot supply honestly → it must hand off.
+- `--eval-verdict fail` still open to the agent (failing is safe).
+- New `--reviewer <name>` arg; recorded in the verdict as `reviewer`.
+- New `--restage self_eval` target (works from DONE): clears verdict + deletes
+  eval_review.md, back to SELF_EVAL.
+- `_AGENT_SELF_EVAL_NOTE` + SKILL.md (canonical + scoped, synced): "you cannot pass
+  this, hand off; fabricating a review will not get you through."
+Tested: fake review + pass → REFUSED; pass --reviewer claude-code → accepted; fail →
+works; restage self_eval → clears.
+
+REMAINING: `describe_frames.py` (vision helper writing eval_review.md) is now the
+clear unblock for autonomous agent runs — still on the backlog.

@@ -662,11 +662,13 @@ user rather than looped on.
 {agent_note}"""
 
 _AGENT_SELF_EVAL_NOTE = """
-NOTE: this pipeline was started by an agent that cannot view images. You cannot
-produce eval/eval_review.md yourself. Either (a) have a human or Claude Code
-inspect eval/*.png and run `--eval-verdict pass` after writing the review, or
-(b) run `describe_frames.py` once it exists to generate the review. Do NOT run
-`--eval-verdict pass` blind — it will be refused.
+NOTE: this pipeline was started by an agent that cannot view images. **You
+cannot pass this phase — `--eval-verdict pass` from you is refused, with or
+without an eval_review.md (a text-only model has, in the past, fabricated a
+detailed frame-by-frame review to get through).** Hand off: a human or Claude
+Code inspects eval/*.png, writes their real findings to eval/eval_review.md,
+and runs `pipeline.py <dir> --eval-verdict pass --reviewer <name>`. You MAY
+run `--eval-verdict fail` if the duration check or something else is wrong.
 """
 
 
@@ -719,7 +721,8 @@ def generate_eval_frames(state: dict) -> str:
     return f"Duration check: output {actual}s vs EDL {expected}s — {flag}."
 
 
-def phase_self_eval(state: dict, verdict: str | None, restage: str | None) -> None:
+def phase_self_eval(state: dict, verdict: str | None, restage: str | None,
+                    reviewer: str | None = None) -> None:
     edit_dir = Path(state["edit_dir"])
     se = state["gates"]["self_eval"]
 
@@ -732,19 +735,30 @@ def phase_self_eval(state: dict, verdict: str | None, restage: str | None) -> No
         sys.exit(0)
 
     if verdict == "pass":
-        # A pass must be backed by a written frame-by-frame review. An agent
-        # that can't see the frames cannot produce this; a human, Claude Code,
-        # or describe_frames.py must. Blocks the blind rubber-stamp that let a
-        # visibly-broken render reach DONE on 2026-09-08.
+        # An agent-started run CANNOT pass its own visual QC. The model is
+        # text-only; on 2026-09-08 Beast wrote a detailed, confident, entirely
+        # FABRICATED frame-by-frame review ("man in blue shirt... clean cut,
+        # no flash") and passed. An existence+length check on prose can't
+        # catch that. So: pass on an agent-started run requires --reviewer
+        # <name>, which asserts a human / Claude Code / describe_frames.py
+        # actually looked. `fail` stays open to the agent (failing is safe).
+        if running_as_agent(state) and not reviewer:
+            print("REFUSED: this run was started by an agent that cannot see the "
+                  "eval frames — it cannot pass its own visual QC.\n"
+                  "A human or Claude Code must inspect eval/*.png and run:\n"
+                  f"    pipeline.py {edit_dir} --eval-verdict pass --reviewer <name>\n"
+                  "(from a non-agent context; eval/eval_review.md must hold their "
+                  "real findings). Or run `--eval-verdict fail` if something is wrong.")
+            sys.exit(1)
         txt = review.read_text().strip() if review.exists() else ""
         if len(txt) < 100:
             print(f"REFUSED: --eval-verdict pass requires a real review at "
                   f"{review} (found {'nothing' if not txt else str(len(txt)) + ' chars'}). "
                   f"Inspect every eval/*.png and write what you checked and saw, one "
-                  f"line per frame, then retry."
-                  + (_AGENT_SELF_EVAL_NOTE if running_as_agent(state) else ""))
+                  f"line per frame, then retry.")
             sys.exit(1)
         se["verdict"] = "pass"
+        se["reviewer"] = reviewer or "self"
         state["phase"] = "DONE"
         save_state(state)
         _finish(state)
@@ -825,6 +839,15 @@ def do_restage(state: dict, target: str) -> None:
     edit_dir = Path(state["edit_dir"])
     if target in ("strategy", "edl"):
         (edit_dir / "edl.effective.json").unlink(missing_ok=True)  # stale derived cut list
+    if target == "self_eval":
+        # back to SELF_EVAL: drop the verdict + any (possibly fabricated) review
+        (edit_dir / "eval" / "eval_review.md").unlink(missing_ok=True)
+        state["phase"] = "SELF_EVAL"
+        state["gates"]["self_eval"] = {"passes": 0, "verdict": None}
+        save_state(state)
+        print(f"Restaged to SELF_EVAL (verdict + eval_review.md cleared). "
+              f"Run `pipeline.py {edit_dir}` to regenerate eval frames.")
+        sys.exit(0)
     if target == "strategy":
         state["phase"] = "STRATEGY"
         for g in ("strategy_confirmed", "edl_validated", "render_done"):
@@ -954,7 +977,11 @@ def main() -> None:
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--confirm-strategy", action="store_true")
     ap.add_argument("--eval-verdict", choices=["pass", "fail"], default=None)
-    ap.add_argument("--restage", choices=["strategy", "edl", "render"], default=None)
+    ap.add_argument("--reviewer", type=str, default=None,
+                    help="who inspected the eval frames (required to `--eval-verdict "
+                         "pass` an agent-started run; a text-only agent cannot supply it "
+                         "honestly and must hand off)")
+    ap.add_argument("--restage", choices=["strategy", "edl", "render", "self_eval"], default=None)
     args = ap.parse_args(argv)
 
     edit_dir = args.edit_dir.resolve()
@@ -974,7 +1001,7 @@ def main() -> None:
         if state["phase"] != "SELF_EVAL":
             sys.exit(f"REFUSED: --eval-verdict only valid in SELF_EVAL phase "
                      f"(currently {state['phase']}).")
-        phase_self_eval(state, args.eval_verdict, args.restage)
+        phase_self_eval(state, args.eval_verdict, args.restage, args.reviewer)
         return
     if args.restage:
         do_restage(state, args.restage)
