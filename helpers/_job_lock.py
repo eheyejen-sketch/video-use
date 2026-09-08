@@ -112,6 +112,36 @@ def _unquote(v: str) -> str:
     return v
 
 
+def _is_real_profile_dir(p: Path) -> bool:
+    # a real service install has a generated service-env/; a bare dir that
+    # `openclaw --profile X` autocreated (just state/ + tmp/) does not.
+    return (p / "service-env").is_dir()
+
+
+def _profile_root(profile: str | None) -> Path | None:
+    """The config dir for a profile, or None. A named profile with no real
+    service install (e.g. an agent passing `--notify-profile jensen` when
+    Jensen IS the default `~/.openclaw`; the bad flag even autocreates a stub
+    `~/.openclaw-jensen/`) falls back to the default `~/.openclaw`."""
+    home = Path(os.path.expanduser("~"))
+    if profile:
+        p = home / f".openclaw-{profile}"
+        if _is_real_profile_dir(p):
+            return p
+    d = home / ".openclaw"
+    return d if _is_real_profile_dir(d) else None
+
+
+def _effective_profile(profile: str | None) -> str | None:
+    """`profile` if it's a real service install (`~/.openclaw-<profile>/service-env`
+    exists), else None (default). Keeps a bogus `--notify-profile` from breaking
+    the `openclaw --profile X` call and from autocreating a stray config dir."""
+    home = Path(os.path.expanduser("~"))
+    if profile and _is_real_profile_dir(home / f".openclaw-{profile}"):
+        return profile
+    return None
+
+
 def _resolve_gateway_token(profile: str | None) -> str | None:
     """The worker is a detached grandchild of an OpenClaw `exec` call, and
     `exec` does NOT pass OPENCLAW_* secrets to spawned commands (a correct
@@ -126,8 +156,9 @@ def _resolve_gateway_token(profile: str | None) -> str | None:
     for var in ("OPENCLAW_GATEWAY_TOKEN", "OPENCLAW_GATEWAY_PASSWORD"):
         if os.environ.get(var):
             return os.environ[var]
-    home = Path(os.path.expanduser("~"))
-    root = home / (f".openclaw-{profile}" if profile else ".openclaw")
+    root = _profile_root(profile)
+    if root is None:
+        return None
     env_dir = root / "service-env"
     if not env_dir.is_dir():
         return None
@@ -154,10 +185,11 @@ def notify_completion(session_key: str | None, profile: str | None, message: str
     is its job log), so a broken notify path is visible in jobs/<key>.log."""
     if not session_key:
         return
+    eff = _effective_profile(profile)  # drop a --notify-profile with no config dir
     token = _resolve_gateway_token(profile)
     cmd = ["openclaw"]
-    if profile:
-        cmd += ["--profile", profile]
+    if eff:
+        cmd += ["--profile", eff]
     cmd += ["system", "event", "--session-key", session_key,
             "--text", message, "--mode", "now"]
     if token:

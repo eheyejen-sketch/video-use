@@ -342,3 +342,26 @@ guard + schema-relax (beat/quote optional); new filler_cuts.py; SKILL.md ×3 + S
 STILL OPEN (backlog): describe_frames.py (vision helper → autonomous agent self-eval);
 STRATEGY confirmation is forgeable; project.md double-appended this run (fake + real
 blocks both present) — cosmetic.
+
+## Jensen run — bogus --notify-profile, fixed at the class level (2026-09-08 ~17:38)
+
+Jensen passed `--notify-profile jensen` despite its SOUL.md saying to OMIT it
+(Jensen = the default `~/.openclaw` profile, unnamed). `openclaw --profile jensen`
+points at `~/.openclaw-jensen/` — which doesn't exist as a real install, and the CLI
+call even AUTOCREATED a stub `~/.openclaw-jensen/{state,tmp}/`. Notify would fail auth.
+
+Fixed in `_job_lock.py`:
+- `_is_real_profile_dir(p)` = `p/service-env` exists (the real-service-install marker;
+  a stub `openclaw --profile X` autocreates has only state/ + tmp/).
+- `_effective_profile(profile)` → the profile only if it's a real install, else None.
+  `notify_completion` uses it for the `--profile` flag → a bad name is dropped, no
+  stray dir, `openclaw` uses the default.
+- `_resolve_gateway_token` falls back to `~/.openclaw/service-env` when the named
+  profile isn't real → token still resolves.
+Verified: bogus 'jensen' → `--profile` dropped, token found, `[notify] system event
+sent`. 'unleashed' still resolves to itself.
+
+NOTE: Jensen's IN-FLIGHT transcribe worker (launched 17:36 with the old _job_lock in
+memory) still has the broken notify — it may stall after transcription like Beast's
+early runs. The fix applies to its RENDER worker + all future runs.
+Stray `~/.openclaw-jensen/` dir left by the bad flag — safe to `rm -rf` (cosmetic).
