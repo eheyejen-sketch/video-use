@@ -53,10 +53,21 @@ DEFAULT_MIN_SUBRANGE_S = 0.08
 MIN_FILLER_DUR_S = 0.05
 
 
-def _load_words(edit_dir: Path, source_name: str) -> list[dict]:
-    p = edit_dir / "transcripts" / f"{source_name}.json"
-    data = json.loads(p.read_text())
-    return [w for w in data.get("words", []) if w.get("type", "word") == "word"]
+def _load_words(edit_dir: Path, source_name: str, edl: dict | None = None) -> list[dict]:
+    # transcripts are named by the source file's stem, not the EDL key.
+    names = [source_name]
+    if edl:
+        p = (edl.get("sources") or {}).get(source_name)
+        if p:
+            names.append(Path(p).stem)
+    for name in names:
+        p = edit_dir / "transcripts" / f"{name}.json"
+        if p.exists():
+            data = json.loads(p.read_text())
+            return [w for w in data.get("words", []) if w.get("type", "word") == "word"]
+    raise FileNotFoundError(
+        f"no transcript for source {source_name!r} (tried {', '.join(names)}) in {edit_dir}"
+    )
 
 
 def _fillers_in(words: list[dict], lo: float, hi: float) -> list[tuple[float, float, str]]:
@@ -125,7 +136,7 @@ def expand_edl(edl: dict, edit_dir: Path,
     for r in edl.get("ranges", []):
         src = r["source"]
         if src not in words_by_src:
-            words_by_src[src] = _load_words(edit_dir, src)
+            words_by_src[src] = _load_words(edit_dir, src, edl)
         before = len(new_ranges)
         expanded = strip_fillers_from_range(r, words_by_src[src], pad, min_subrange)
         new_ranges.extend(expanded)

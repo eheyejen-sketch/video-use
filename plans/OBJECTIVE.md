@@ -219,3 +219,25 @@ twice today on the EDL-authoring turn). Fix: the LLM authors only COARSE ranges 
   the approval is for direct debug use + consistency.)
 - Unit-tested: coarse [0,4] with 2 fillers → 3 sub-ranges at the right boundaries;
   edl.effective.json validates clean; full pipeline EDL→RENDER advance works.
+
+## Fixes on Beast's first strip_fillers EDL (2026-09-08 ~16:30)
+
+Beast (post-reset, old session flushed the turn) wrote a GOOD EDL: correct schema,
+`strip_fillers: true`, 5 COARSE ranges (not 15 micro-cuts — the point), `omissions`
+used for content not fillers, background + subtitles. Two friction points fixed:
+
+1. Schema required `beat`+`quote` on every range; Beast (token-limited) filled them
+   only on range 1. Now only `source`/`start`/`end`/`reason` are required; beat/quote
+   optional (documentation, render doesn't use them).
+2. Beast keyed its source `"C0103"` (copied from the SKILL.md format example) while
+   the file/transcript is `IMG_4328`. `render.py` + `filler_cuts.py` transcript
+   lookup was `transcripts/<edl_key>.json` → not found → validation silently skipped
+   / expansion crashed. Now both resolve `transcripts/<Path(sources[key]).stem>.json`
+   (fall back to the key). Real correctness fix — cut validation was being skipped
+   whenever the EDL key ≠ video stem.
+
+Real EDL gate now runs correctly on Beast's edl.json and catches ONE real issue: its
+omission `{36.00,37.74}` doesn't cover the full gap `{35.28,37.74}` between ranges 2
+and 3 ("so," in the uncovered sliver). Beast needs to widen that omission or move a
+boundary — a one-line fix. strip_fillers expansion verified: 5 coarse → 16 effective
+ranges, 16 fillers removed.

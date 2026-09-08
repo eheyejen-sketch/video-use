@@ -271,15 +271,25 @@ def extract_segment(
 WORD_CLIP_TOLERANCE_S = 0.25
 
 
-def _load_transcript_words(edit_dir: Path, source_name: str) -> list[dict] | None:
-    path = edit_dir / "transcripts" / f"{source_name}.json"
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text())
-    except Exception:
-        return None
-    return [w for w in data.get("words", []) if w.get("type", "word") == "word"]
+def _load_transcript_words(edit_dir: Path, source_name: str,
+                            edl: dict | None = None) -> list[dict] | None:
+    # transcripts are named by the SOURCE FILE's stem, not by whatever key
+    # the EDL used for it (agents copy "C0103" from the format example). Try
+    # the key, then the file stem from edl["sources"][key].
+    candidates = [source_name]
+    if edl:
+        p = (edl.get("sources") or {}).get(source_name)
+        if p:
+            candidates.append(Path(p).stem)
+    for name in candidates:
+        path = edit_dir / "transcripts" / f"{name}.json"
+        if path.exists():
+            try:
+                data = json.loads(path.read_text())
+            except Exception:
+                return None
+            return [w for w in data.get("words", []) if w.get("type", "word") == "word"]
+    return None
 
 
 def _classify_cut_warning(msg: str) -> dict:
@@ -337,7 +347,7 @@ def validate_cuts_against_transcripts(edl: dict, edit_dir: Path) -> list[str]:
         by_source.setdefault(r["source"], []).append(r)
 
     for source_name, source_ranges in by_source.items():
-        words = _load_transcript_words(edit_dir, source_name)
+        words = _load_transcript_words(edit_dir, source_name, edl)
         if words is None:
             warnings.append(
                 f"no cached transcript found for source '{source_name}' -- cuts for "

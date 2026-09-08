@@ -483,7 +483,10 @@ def validate_edl_schema(edl_path: Path, edit_dir: Path, state: dict) -> list[str
         ranges = []
     for i, r in enumerate(ranges):
         tag = f"ranges[{i}]"
-        for k in ("source", "start", "end", "beat", "quote", "reason"):
+        # required = the fields that affect the cut; beat/quote are
+        # documentation and optional (a token-limited model routinely omits
+        # them and the render doesn't need them).
+        for k in ("source", "start", "end", "reason"):
             if k not in r:
                 errs.append(f"{tag} missing {k!r}")
         if "source" in r and srcmap and r["source"] not in srcmap:
