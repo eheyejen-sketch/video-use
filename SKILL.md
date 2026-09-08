@@ -106,6 +106,10 @@ INGEST → STRATEGY → EDL → RENDER → SELF_EVAL → DONE
 
 State lives in `<edit>/pipeline_state.json`. Every call is re-entrant and returns
 fast; the slow steps (transcribe, render) self-background and wake you when done.
+**Because state is on disk, a run survives a context overflow / session reset** — a
+long edit fills an agent's context with transcript + briefing + render output; if
+you hit "prompt too large", reset the session and re-run `pipeline.py <edit-dir>`,
+which resumes at the saved phase (nothing re-transcribed or re-rendered).
 
 | Command | Phase | The driver does (no choice for you) | You owe back |
 |---|---|---|---|
