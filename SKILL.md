@@ -114,7 +114,7 @@ fast; the slow steps (transcribe, render) self-background and wake you when done
 | `pipeline.py <dir> --confirm-strategy` | STRATEGY | check `strategy.md` exists, is substantive, has a `## User confirmation` quote | write `strategy.md` (4–8 sentences + the confirmation section) |
 | `pipeline.py <dir>` | EDL | schema-check `edl.json`; run `render.py --validate-only` (cut-vs-speech); refuse on any failure, no `--force` | write `edl.json` per **EDL format** below |
 | `pipeline.py <dir>` | RENDER | `render.py … --build-subtitles` | nothing — wait |
-| `pipeline.py <dir>` | SELF_EVAL | extract `timeline_view` frames of the **rendered output** at every cut (±1.5s) + head/tail/mids; check duration vs EDL | inspect every `eval/*.png` (see checklist), then `--eval-verdict pass` or `--eval-verdict fail --restage edl\|render` (cap 3 fails) |
+| `pipeline.py <dir>` | SELF_EVAL | extract `timeline_view` frames of the **rendered output** at every cut (±1.5s) + head/tail/mids; check duration vs EDL | inspect every `eval/*.png` (see checklist), write findings to `eval/eval_review.md` (one line per frame — `--eval-verdict pass` is refused without it), then `--eval-verdict pass` or `--eval-verdict fail --restage edl\|render` (cap 3 fails) |
 | `pipeline.py <dir> --eval-verdict pass` | → DONE | append the session block to `project.md` | — |
 
 `pipeline.py <dir> --status` prints the current phase and exactly what's owed.
@@ -125,12 +125,15 @@ user (INGEST), the cut strategy (STRATEGY), the take/cut selection in the EDL an
 animations (EDL), and the visual judgement on the eval frames (SELF_EVAL). The
 driver owns correctness; you own taste.
 
-**Self-eval frame checklist** (what to look for in each `eval/*.png`):
+**Self-eval frame checklist** (what to look for in each `eval/*.png`, then record per-frame in `eval/eval_review.md`):
 - visual discontinuity / flash / jump at the cut
 - waveform spike at the boundary (audio pop past the 30 ms fade)
 - subtitle hidden behind an overlay (Rule 1 violation)
 - overlay misaligned or showing wrong frames (Rule 4 violation)
+- the intended background swap / grade actually took effect (a matte can "succeed" and change nothing — verify visually)
 - grade consistency, subtitle readability, overall coherence (head/tail/mid frames)
+
+`--eval-verdict pass` is refused unless `eval/eval_review.md` exists with a real assessment. An OpenClaw agent (text-only model) **cannot** produce this — a human, Claude Code, or `describe_frames.py` must inspect the frames and write it. Do not pass blind.
 
 ## If the pipeline refuses
 
@@ -147,6 +150,10 @@ driver owns correctness; you own taste.
   `render.py --force` — the pipeline doesn't use it and neither should you here.
 - **`INGEST FAILED: …`** — transcription failed or produced a non-verbatim file.
   Check `<edit>/jobs/*.log`.
+- **`REFUSED: --eval-verdict pass requires a real review …`** — inspect every
+  `eval/*.png` and write a per-frame assessment to `eval/eval_review.md` first. A
+  text-only agent can't do this; hand off to a human, Claude Code, or
+  `describe_frames.py`. `--eval-verdict fail` never needs the review.
 
 ## Cut craft (techniques)
 

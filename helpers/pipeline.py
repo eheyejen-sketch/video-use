@@ -123,6 +123,14 @@ def notify_args(state: dict) -> list[str]:
     return out
 
 
+def running_as_agent(state: dict) -> bool:
+    """True when the pipeline was `init`-ed by an OpenClaw agent (Jensen/Beast) --
+    they pass --notify-session/--notify-profile. Claude Code passes neither.
+    Used to gate steps an agent structurally can't do (viewing eval frames)."""
+    n = state.get("notify") or {}
+    return bool(n.get("profile") or n.get("session_key"))
+
+
 def ffprobe_json(src: Path) -> dict:
     proc = subprocess.run(
         ["ffprobe", "-v", "quiet", "-print_format", "json",
@@ -361,9 +369,7 @@ def phase_ingest(state: dict) -> None:
     # OpenClaw agent (Jensen/Beast run text-only models and cannot view an
     # image anywhere; the frames are wasted ffmpeg work + an "I couldn't view
     # this" line every run). Claude Code (no notify profile) still gets them.
-    running_as_agent = bool((state.get("notify") or {}).get("profile")
-                            or (state.get("notify") or {}).get("session_key"))
-    if not running_as_agent:
+    if not running_as_agent(state):
         for s in sources:
             dur = inv[s.name]["duration_s"] or 0.0
             timeline_sample(s, 0.0, min(10.0, dur), edit_dir / "verify" / f"{s.stem}_sample_head.png")
@@ -604,13 +610,24 @@ YOU OWE: inspect every `{edit}/eval/*.png` for —
   - a waveform spike at a boundary (audio pop past the 30 ms fade)
   - a subtitle hidden behind an overlay
   - an overlay showing the wrong frames / misaligned
+  - the intended background swap / grade actually took effect
   - grade consistency, subtitle readability, overall coherence
+Write your findings — one line per frame, what you checked and saw — to
+`{edit}/eval/eval_review.md`. `--eval-verdict pass` is REFUSED without it.
 
-All clear   →  pipeline.py {edit} --eval-verdict pass
+All clear   →  write eval/eval_review.md, then  pipeline.py {edit} --eval-verdict pass
 Any problem →  fix the EDL (or render settings), then
               pipeline.py {edit} --eval-verdict fail --restage edl   (or: --restage render)
 Hard cap: 3 fail cycles, after which remaining issues must be surfaced to the
 user rather than looped on.
+{agent_note}"""
+
+_AGENT_SELF_EVAL_NOTE = """
+NOTE: this pipeline was started by an agent that cannot view images. You cannot
+produce eval/eval_review.md yourself. Either (a) have a human or Claude Code
+inspect eval/*.png and run `--eval-verdict pass` after writing the review, or
+(b) run `describe_frames.py` once it exists to generate the review. Do NOT run
+`--eval-verdict pass` blind — it will be refused.
 """
 
 
@@ -667,12 +684,27 @@ def phase_self_eval(state: dict, verdict: str | None, restage: str | None) -> No
     edit_dir = Path(state["edit_dir"])
     se = state["gates"]["self_eval"]
 
+    review = edit_dir / "eval" / "eval_review.md"
+
     if verdict is None:
         dline = generate_eval_frames(state)
-        print(SELF_EVAL_CHECKLIST.format(edit=edit_dir, duration_line=dline))
+        note = _AGENT_SELF_EVAL_NOTE if running_as_agent(state) else ""
+        print(SELF_EVAL_CHECKLIST.format(edit=edit_dir, duration_line=dline, agent_note=note))
         sys.exit(0)
 
     if verdict == "pass":
+        # A pass must be backed by a written frame-by-frame review. An agent
+        # that can't see the frames cannot produce this; a human, Claude Code,
+        # or describe_frames.py must. Blocks the blind rubber-stamp that let a
+        # visibly-broken render reach DONE on 2026-09-08.
+        txt = review.read_text().strip() if review.exists() else ""
+        if len(txt) < 100:
+            print(f"REFUSED: --eval-verdict pass requires a real review at "
+                  f"{review} (found {'nothing' if not txt else str(len(txt)) + ' chars'}). "
+                  f"Inspect every eval/*.png and write what you checked and saw, one "
+                  f"line per frame, then retry."
+                  + (_AGENT_SELF_EVAL_NOTE if running_as_agent(state) else ""))
+            sys.exit(1)
         se["verdict"] = "pass"
         state["phase"] = "DONE"
         save_state(state)

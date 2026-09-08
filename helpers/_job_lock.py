@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -102,27 +103,75 @@ def spawn_background_worker(edit_dir: Path, job_key: str, worker_argv: list[str]
     return data
 
 
+_TOKEN_RE = re.compile(r'^\s*export\s+OPENCLAW(?:_[A-Z0-9]+)*_GATEWAY_AUTH_TOKEN\s*=\s*(.+?)\s*$')
+
+
+def _unquote(v: str) -> str:
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        return v[1:-1]
+    return v
+
+
+def _resolve_gateway_token(profile: str | None) -> str | None:
+    """The worker is a detached grandchild of an OpenClaw `exec` call, and
+    `exec` does NOT pass OPENCLAW_* secrets to spawned commands (a correct
+    security boundary). So `openclaw system event` from here fails auth --
+    which is why the whole notify path silently did nothing from an agent
+    context until 2026-09-08. Recover the token from the profile's
+    service-env file, which OpenClaw generates at a stable path.
+
+      Jensen (default profile): ~/.openclaw/service-env/*.env
+      Beast   (profile=unleashed): ~/.openclaw-unleashed/service-env/*.env
+    """
+    for var in ("OPENCLAW_GATEWAY_TOKEN", "OPENCLAW_GATEWAY_PASSWORD"):
+        if os.environ.get(var):
+            return os.environ[var]
+    home = Path(os.path.expanduser("~"))
+    root = home / (f".openclaw-{profile}" if profile else ".openclaw")
+    env_dir = root / "service-env"
+    if not env_dir.is_dir():
+        return None
+    for env_file in sorted(env_dir.glob("*.env")):
+        try:
+            for line in env_file.read_text().splitlines():
+                m = _TOKEN_RE.match(line)
+                if m:
+                    return _unquote(m.group(1).strip())
+        except OSError:
+            continue
+    return None
+
+
 def notify_completion(session_key: str | None, profile: str | None, message: str) -> None:
-    """Best-effort wake-up of the OpenClaw session that launched this job, so
-    the agent resumes without waiting for the human to prompt it again.
-    Confirmed 2026-09-07: a background job finishing does not, by itself,
-    give the agent any signal to check back -- its own turn already ended
-    when it started the job. This closes that gap via `openclaw system
-    event`, which injects a message and wakes the session immediately
-    (`--mode now`) instead of waiting for the next heartbeat. Silently does
-    nothing if session_key is unset (e.g. Claude Code usage, which has no
-    OpenClaw session to notify) or if the CLI call fails for any reason --
-    a missed notification should never fail the job itself."""
+    """Wake the OpenClaw session that launched this job so the agent resumes
+    without waiting for a human prompt. A background job finishing gives the
+    agent no signal on its own -- its turn ended when the job started. This
+    fires `openclaw system event ... --mode now`.
+
+    No-ops (returns) when session_key is unset (Claude Code has no session to
+    notify). A notification failure never fails the job -- but unlike before
+    2026-09-08 it is NOT silent: the outcome is printed (the worker's stdout
+    is its job log), so a broken notify path is visible in jobs/<key>.log."""
     if not session_key:
         return
+    token = _resolve_gateway_token(profile)
     cmd = ["openclaw"]
     if profile:
         cmd += ["--profile", profile]
-    cmd += ["system", "event", "--session-key", session_key, "--text", message, "--mode", "now"]
+    cmd += ["system", "event", "--session-key", session_key,
+            "--text", message, "--mode", "now"]
+    if token:
+        cmd += ["--token", token]
     try:
-        subprocess.run(cmd, capture_output=True, timeout=30)
-    except Exception:
-        pass  # best-effort only; never let a notification failure mask the real job result
+        r = subprocess.run(cmd, capture_output=True, timeout=30, text=True)
+        if r.returncode == 0:
+            print(f"[notify] system event sent to {session_key}"
+                  f"{'' if token else ' (no token resolved -- may have failed auth)'}")
+        else:
+            print(f"[notify] FAILED rc={r.returncode}: "
+                  f"{(r.stderr or r.stdout or '').strip()[:300]}")
+    except Exception as e:  # noqa: BLE001 -- never let a notify failure fail the job
+        print(f"[notify] FAILED (exception): {e}")
 
 
 def mark_done(edit_dir: Path, job_key: str, output_path: str,

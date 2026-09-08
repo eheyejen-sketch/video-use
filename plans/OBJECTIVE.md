@@ -94,3 +94,44 @@ continuing._
 - 2026-09-08 10:3x — Propagated: both scoped SKILL.md copies updated (driver process table, Hard Rules 6/8, "If the pipeline refuses", EDL omissions) and re-synced byte-identical; both SOUL.md Video Editing sections rewritten to "drive through pipeline.py"; pipeline.py added to exec-approvals for Jensen + Beast (`approvals allowlist add --agent "*"`); both audit baselines regenerated; audit runs clean, no drift alert. — DONE-pending-review: criterion 6 (docs + approvals)
 - 2026-09-08 09:0x — pipeline.py: INGEST skips the 2 auto timeline_view sample frames when running under an OpenClaw agent (notify.profile/session_key set) — Beast/Jensen run text-only models (qwen3.6-35b-a3b, input=["text"]) and cannot view an image regardless of path; the frames were wasted ffmpeg + an "I couldn't view this" line. Claude Code still gets them. briefing.md drops the "Visual samples" section when no samples exist. — small fix, keeps criteria on track
 - 2026-09-08 09:0x — FOLLOW-UP LOGGED (separate deliverable, not today): `describe_frames.py` vision helper — pipeline calls it in SELF_EVAL, it POSTs eval PNGs to LM Studio's VL model (qwen3.6-35b-a3b-mlx-vl-oq8, already in Beast/Jensen config + on the server) via OpenAI-compatible /v1/chat/completions and returns a TEXT defect report the agent's own model consumes. No session model-switch, no OpenClaw sub-agent. Open Qs: persistent-load vs JIT the VL model (latency/RAM), whether VL Qwen has the unsuppressable-reasoning latency, prompt design for spotting cut flashes/subtitle collisions/overlay misalignment. Prompted by Beast's "couldn't view the sample frames" in the 2026-09-08 live run.
+
+## Beast live run — 2026-09-08 (test-beast/IMG_4328.MOV → IMG_4328-edited/)
+
+**Result: pipeline reached DONE. Core objective substantially proven; 4 gaps surfaced.**
+
+PASSED (criteria 1, 2, 3 mechanisms verified in a real agent run):
+- Beast ran INGEST → STRATEGY → EDL → RENDER → SELF_EVAL → DONE. Every gate enforced.
+- `check_fillers.py` auto-run; Beast cited "19 fillers" — the tool output, not eyeballed.
+- Gap table cited correctly, no fabricated pauses (contrast: last night's invented "2s pause at 66s").
+- EDL passed schema + cut-validator clean on first try; 2 removed-speech spans declared in `omissions` (design worked with 2 entries, not the 19-error wall).
+- Render succeeded: 4 segments → concat → RVM matte (AVIF door→interior swap **worked**, confirmed against source frames) → 94-cue SRT → composite → loudnorm. final.mp4 valid.
+- project.md written with strategy + Mike's confirmation quote + cut decisions.
+
+GAPS (what the driver can't/doesn't enforce, all showed up in one run):
+1. **--notify-session broken from worker context** (blocking). Worker spawned via OpenClaw exec has no gateway token → `openclaw system event` fails auth → swallowed by `except Exception: pass`. Beast stalled 15 min at RENDER; needed a manual Discord poke from Mike. The earlier "auto-resume" after INGEST was a heartbeat catch, NOT the notify (I wrongly reported it as the notify working).
+2. **Blind self-eval.** Beast ran `--eval-verdict pass` without seeing the eval/*.png (text-only model). The pipeline forced the frames to exist but can't force a blind agent to evaluate them. In this run the frames were fine, but it's a rubber stamp.
+3. **Edit fidelity ≠ strategy.** Beast's strategy said "strip all 19 fillers" + "~45s"; EDL kept 11 fillers inside the 4 coarse ranges (removed only the 8 that fell in dropped spans), output 54.9s, and kept "Hi, everyone" despite the range `reason` claiming it was trimmed. Driver enforces order + cut safety, not "EDL does what strategy said."
+4. **Subtitles carry the fillers.** master.srt = verbatim kept-range transcript; 11 standalone UH/UM cues. render.py --build-subtitles doesn't filter fillers.
+
+VERIFICATION-DISCIPLINE NOTE: three times this run I stated something as fact without checking — "notify chain worked end to end" (was heartbeat), "matte didn't take" (it did; never extracted a source frame). Same pattern as the /reflect and design-history findings. The OBJECTIVE.md acceptance-criteria discipline is meant to catch exactly this; it did, late.
+
+## Follow-up fixes 1 & 2 — 2026-09-08
+
+**#1 — `--notify-session` now works from worker context.** `_job_lock._resolve_gateway_token(profile)`
+reads the gateway token from the profile's service-env file (`~/.openclaw{-<profile>}/service-env/*.env`,
+handles single-quoted values) when it's not in the env — which it never is for an exec-spawned worker.
+`notify_completion` passes it as `--token` and now PRINTS the outcome (`[notify] system event sent` /
+`[notify] FAILED …`) to the job log instead of `except: pass`. Verified end-to-end in a stripped env
+(no token) → `[notify] system event sent`. CAVEAT: confirmed the auth failure was real and is fixed;
+whether `system event --mode now` reliably triggers a turn is not 100% proven (one earlier manual
+`--mode now` didn't visibly wake Beast within 15 min, possibly confounded). Watch the next clean run.
+
+**#2 — no more blind `--eval-verdict pass`.** `pipeline.py` refuses `--eval-verdict pass` unless
+`eval/eval_review.md` exists with ≥100 chars of real per-frame assessment. `--eval-verdict fail` never
+needs it. When `running_as_agent(state)` the SELF_EVAL message + the REFUSED message carry an explicit
+"you can't see these frames — hand off to a human / Claude Code / describe_frames.py" note. Closes the
+rubber-stamp that let the 2026-09-08 run reach DONE without anyone checking the render (which, in that
+case, was actually fine — but a broken matte would have sailed through identically).
+
+SKILL.md (canonical + both scoped, re-synced identical) updated: SELF_EVAL row, checklist (+ "verify the
+background swap / grade actually took effect"), "If the pipeline refuses" entry.
