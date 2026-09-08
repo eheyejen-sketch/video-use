@@ -195,3 +195,27 @@ background swap / grade actually took effect"), "If the pipeline refuses" entry.
 entry. Any real word in the gap still warns. Unit-tested with a synthetic transcript:
 filler-only gap → clean; gap with "real speech." → warns; declaring it → clean.
 This unblocks proper filler-level editing (was ~15+ UNDECLARED SPEECH REMOVAL errors).
+
+## Deterministic filler-removal path — BUILT (2026-09-08 ~15:15)
+
+Beast's model (qwen3.6-35b-a3b via LM Studio) can't reliably emit a large structured
+EDL — it runs away on reasoning and hits the token ceiling before finishing (failed
+twice today on the EDL-authoring turn). Fix: the LLM authors only COARSE ranges +
+`"strip_fillers": true`; the pipeline does the micro-cuts.
+
+- `helpers/filler_cuts.py` (new): `expand_edl(edl, edit_dir)` splits each coarse range
+  around every filler word (from check_fillers.py's FILLER_WORDS + verbatim transcript
+  timestamps, ±40ms pad, drop sub-ranges <80ms, ignore <50ms ASR artifacts). CLI too.
+- `pipeline.py` EDL phase: after edl.json passes schema+cut check, expand →
+  `edl.effective.json`, re-validate it (filler-only gaps auto-allowed by the
+  2026-09-08 render.py change), advance. RENDER + self-eval use edl.effective.json;
+  project.md records "N coarse → M effective ranges". `--restage strategy|edl` deletes
+  the stale edl.effective.json. Schema validator accepts `strip_fillers` (bool).
+- SKILL.md (canonical + scoped, synced) EDL format + process table + Hard-Rule-adjacent
+  guidance: "coarse ranges + strip_fillers for fillers; omissions for dropped content".
+- SOUL.md ×2 scope lists + scoped SKILL scope note: filler_cuts.py added.
+- exec-approvals: filler_cuts.py added `--agent "*"` for Jensen + Beast; both baselines
+  regenerated; audit clean. (pipeline→filler_cuts is a plain subprocess, not gated —
+  the approval is for direct debug use + consistency.)
+- Unit-tested: coarse [0,4] with 2 fillers → 3 sub-ranges at the right boundaries;
+  edl.effective.json validates clean; full pipeline EDL→RENDER advance works.

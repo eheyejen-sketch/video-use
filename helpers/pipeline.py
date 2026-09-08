@@ -426,9 +426,12 @@ def phase_strategy(state: dict, confirm: bool) -> None:
     state["gates"]["strategy_confirmed"]["done"] = True
     save_state(state)
     print(f"Strategy confirmed. Phase EDL.\n\n"
-          f"YOU OWE: `{edit_dir}/edl.json` per SKILL.md 'EDL format'. Use the "
-          f"'Editor sub-agent brief' section if this is multi-take. Every range needs "
-          f"source/start/end/beat/quote/reason. Then run:\n\n    pipeline.py {edit_dir}")
+          f"YOU OWE: `{edit_dir}/edl.json` per SKILL.md 'EDL format'. Every range needs "
+          f"source/start/end/beat/quote/reason. To strip filler words, author COARSE "
+          f"structural ranges (keep the content you want; do NOT try to cut individual "
+          f"um/uh yourself) and set `\"strip_fillers\": true` — the pipeline removes every "
+          f"filler inside your ranges from check_fillers.py's timestamps. Use `omissions` "
+          f"for deliberate CONTENT you drop. Then run:\n\n    pipeline.py {edit_dir}")
     sys.exit(0)
 
 
@@ -443,6 +446,8 @@ def validate_edl_schema(edl_path: Path, edit_dir: Path, state: dict) -> list[str
 
     if "version" not in edl:
         errs.append("missing 'version'")
+    if "strip_fillers" in edl and not isinstance(edl["strip_fillers"], bool):
+        errs.append("'strip_fillers' must be true or false")
     srcmap = edl.get("sources")
     if not isinstance(srcmap, dict) or not srcmap:
         errs.append("'sources' must be a non-empty {name: abs_path} map")
@@ -551,6 +556,30 @@ def phase_edl(state: dict) -> None:
         sys.exit(1)
 
     print("CUT VALIDATION OK — boundaries land in silence; all removed speech is declared.")
+
+    # strip_fillers: the author's ranges are coarse; expand them into the
+    # concrete cut list (fillers removed from check_fillers.py timestamps).
+    # edl.effective.json is what RENDER / self-eval actually use; edl.json
+    # stays as the human-authored intent.
+    edl_full = json.loads(edl_path.read_text())
+    eff_path = edit_dir / "edl.effective.json"
+    exp = run_helper("filler_cuts.py", str(edl_path), "--edit-dir", str(edit_dir),
+                     "-o", str(eff_path), check=False)
+    if exp.returncode != 0:
+        print(f"filler-strip expansion failed:\n{exp.stdout}{exp.stderr}")
+        sys.exit(2)
+    if edl_full.get("strip_fillers"):
+        print(exp.stdout.strip())
+        r2 = run_helper("render.py", str(eff_path), "--validate-only", "--json", check=False)
+        w2 = json.loads(r2.stdout or "[]")
+        if w2:
+            print("EXPANDED EDL FAILED VALIDATION (the filler-strip produced a bad cut):")
+            for w in w2:
+                print(f"  - {w['message']}")
+            print(f"Your coarse ranges likely have a boundary that doesn't land in a "
+                  f"gap. Fix edl.json and re-run `pipeline.py {edit_dir}`.")
+            sys.exit(1)
+
     state["phase"] = "RENDER"
     state["gates"]["edl_validated"]["done"] = True
     save_state(state)
@@ -561,9 +590,16 @@ def phase_edl(state: dict) -> None:
 
 # ─────────────────────────── phase: RENDER ───────────────────────────
 
+def _render_edl_path(edit_dir: Path) -> Path:
+    """The EDL that actually renders: edl.effective.json (filler-stripped /
+    normalized) if present, else the authored edl.json."""
+    eff = edit_dir / "edl.effective.json"
+    return eff if eff.exists() else edit_dir / "edl.json"
+
+
 def phase_render(state: dict) -> None:
     edit_dir = Path(state["edit_dir"])
-    edl_path = edit_dir / "edl.json"
+    edl_path = _render_edl_path(edit_dir)
     out_path = edit_dir / "final.mp4"
     common = [str(edl_path), "-o", str(out_path)]
 
@@ -645,7 +681,7 @@ def generate_eval_frames(state: dict) -> str:
     out_path = edit_dir / "final.mp4"
     eval_dir = edit_dir / "eval"
     eval_dir.mkdir(parents=True, exist_ok=True)
-    edl = json.loads((edit_dir / "edl.json").read_text())
+    edl = json.loads(_render_edl_path(edit_dir).read_text())  # the real cut list
 
     total = _output_cut_boundaries(edl)[-1]
     probe = subprocess.run(
@@ -747,17 +783,25 @@ def _finish(state: dict) -> None:
     if proj.exists():
         n = proj.read_text().count("\n## Session ") + 1
     strat = (edit_dir / "strategy.md").read_text().strip() if (edit_dir / "strategy.md").exists() else "(none)"
+    # author intent (coarse), not the filler-expanded list
     edl = json.loads((edit_dir / "edl.json").read_text()) if (edit_dir / "edl.json").exists() else {"ranges": []}
     decisions = "\n".join(
         f"  - [{r.get('beat', '?')}] {r.get('source', '?')} {r.get('start')}–{r.get('end')}: {r.get('reason', '')}"
         for r in edl.get("ranges", [])
     )
+    eff_p = edit_dir / "edl.effective.json"
+    filler_note = ""
+    if edl.get("strip_fillers") and eff_p.exists():
+        eff = json.loads(eff_p.read_text())
+        filler_note = (f"\n**Filler removal:** strip_fillers on — {len(edl.get('ranges', []))} "
+                       f"coarse range(s) rendered as {len(eff.get('ranges', []))} "
+                       f"effective range(s) (see edl.effective.json).\n")
     verdict = state["gates"]["self_eval"].get("verdict")
     block = (
         f"\n## Session {n} — {time.strftime('%Y-%m-%d')}\n\n"
         f"**Self-eval verdict:** {verdict}\n\n"
         f"**Strategy:**\n\n{strat}\n\n"
-        f"**Cut decisions:**\n{decisions or '  (none)'}\n"
+        f"**Cut decisions:**\n{decisions or '  (none)'}\n{filler_note}"
     )
     with proj.open("a") as f:
         f.write(block)
@@ -775,6 +819,9 @@ def phase_done(state: dict) -> None:
 # ───────────────────────────── restage ──────────────────────────────
 
 def do_restage(state: dict, target: str) -> None:
+    edit_dir = Path(state["edit_dir"])
+    if target in ("strategy", "edl"):
+        (edit_dir / "edl.effective.json").unlink(missing_ok=True)  # stale derived cut list
     if target == "strategy":
         state["phase"] = "STRATEGY"
         for g in ("strategy_confirmed", "edl_validated", "render_done"):

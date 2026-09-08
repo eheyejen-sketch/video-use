@@ -124,7 +124,7 @@ raw transcript and posted "~15 uhs" instead of advancing — `check_fillers.py` 
 | `pipeline.py init <video>… [--notify-session K --notify-profile P]` | — | create `<video_parent>/edit/` + state; prints the path (don't pass `--edit-dir`) | — |
 | `pipeline.py <dir>` | INGEST | ffprobe → `transcribe.py --verbatim` → `pack_transcripts.py` → `check_fillers.py` → silence-gap table → **`briefing.md`** + 2 sample frames | read `briefing.md`, converse with the user |
 | `pipeline.py <dir> --confirm-strategy` | STRATEGY | check `strategy.md` exists, is substantive, has a `## User confirmation` quote | write `strategy.md` (4–8 sentences + the confirmation section) |
-| `pipeline.py <dir>` | EDL | schema-check `edl.json`; run `render.py --validate-only` (cut-vs-speech); refuse on any failure, no `--force` | write `edl.json` per **EDL format** below |
+| `pipeline.py <dir>` | EDL | schema-check `edl.json`; `render.py --validate-only` (cut-vs-speech); if `strip_fillers` → expand coarse ranges into `edl.effective.json`; refuse on any failure, no `--force` | write `edl.json` per **EDL format** — coarse ranges + `strip_fillers: true` for filler removal |
 | `pipeline.py <dir>` | RENDER | `render.py … --build-subtitles` | nothing — wait |
 | `pipeline.py <dir>` | SELF_EVAL | extract `timeline_view` frames of the **rendered output** at every cut (±1.5s) + head/tail/mids; check duration vs EDL | inspect every `eval/*.png` (see checklist), write findings to `eval/eval_review.md` (one line per frame — `--eval-verdict pass` is refused without it), then `--eval-verdict pass` or `--eval-verdict fail --restage edl\|render` (cap 3 fails) |
 | `pipeline.py <dir> --eval-verdict pass` | → DONE | append the session block to `project.md` | — |
@@ -338,6 +338,7 @@ Match the source unless the user asked for something specific. Common targets: `
 ```json
 {
   "version": 1,
+  "strip_fillers": true,
   "sources": {"C0103": "/abs/path/C0103.MP4", "C0108": "/abs/path/C0108.MP4"},
   "ranges": [
     {"source": "C0103", "start": 2.42, "end": 6.85,
@@ -360,7 +361,9 @@ Match the source unless the user asked for something specific. Common targets: `
 
 `grade` is a preset name or raw ffmpeg filter. `overlays` are rendered animation clips. `subtitles` is optional and applied LAST.
 
-**`omissions`** — every span of *speech* your edit removes (the gap between two kept ranges, or speech before the first / after the last range) must be listed here with a `reason`, or the EDL gate rejects it as `UNDECLARED SPEECH REMOVAL`. This is deliberate: the 2026-09-07 incident deleted real sentences the editor believed were silence. Declaring `{source, start, end, reason}` forces you to have looked at what you're cutting. A pure trim with one continuous range needs no `omissions`. `render.py --force` also bypasses the check for direct manual use — but `pipeline.py` never uses it; declare instead.
+**`strip_fillers`** (bool, default false) — to remove filler words, set this `true` and author **coarse** structural `ranges` (keep the content you want; do **not** try to cut individual um/uh yourself — you'll get the timestamps wrong and burn your token budget on 18 micro-ranges). After the EDL passes, `pipeline.py` expands your ranges into `edl.effective.json`, splitting each range around every filler word from `check_fillers.py`'s exact timestamps (±40 ms). That's what renders. `edl.json` stays as your intent; `project.md` records "N coarse → M effective ranges".
+
+**`omissions`** — every span of *speech* your edit removes on purpose (the gap between two kept ranges, or speech before the first / after the last range) must be listed here with a `reason`, or the EDL gate rejects it as `UNDECLARED SPEECH REMOVAL`. This is for **content** you drop (a tangent, a retake, a bad outro) — not fillers, which `strip_fillers` handles. The 2026-09-07 incident deleted real sentences the editor believed were silence. A pure trim with one continuous range needs no `omissions`. `render.py --force` bypasses the check for direct manual use — `pipeline.py` never uses it; declare instead.
 
 ## Memory — `project.md`
 
