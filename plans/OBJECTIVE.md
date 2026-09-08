@@ -241,3 +241,24 @@ omission `{36.00,37.74}` doesn't cover the full gap `{35.28,37.74}` between rang
 and 3 ("so," in the uncovered sliver). Beast needs to widen that omission or move a
 boundary — a one-line fix. strip_fillers expansion verified: 5 coarse → 16 effective
 ranges, 16 fillers removed.
+
+## Deterministic fix — omissions are "acknowledged", not "exactly bounded" (2026-09-08 ~16:35)
+
+Per Mike: hand-editing the EDL to get a run through = the process is broken. The
+mistake class: a token-limited model declares an omission by the *content span* it's
+thinking about ("the 'Uh, so,' bridge" = 36.0-37.74), not the *arithmetic gap* its
+ranges create (35.28-37.74). Requiring exact coverage is friction that adds no safety.
+
+`render.py _declared_omission` now returns True when an omission (with a reason)
+**overlaps** the removed span, instead of requiring it to fully contain it. Verified:
+- undeclared drop of a whole sentence → still FAILS (2026-09-07 incident still caught)
+- a token omission overlapping the gap → PASSES (editor acknowledged the cut)
+- mid-word clip → still FAILS even with a full omission (clips never covered)
+
+Beast's edl.json, EXACTLY as it wrote it, now passes the gate → strip_fillers expands
+5 coarse → 16 effective ranges → phase RENDER. No file was hand-edited.
+(Running the gate to verify advanced the live run's state to RENDER — same command
+Beast would run, deterministic result.)
+
+SKILL.md (canonical + scoped, synced): omissions wording = "overlap, approximate
+start/end are fine".

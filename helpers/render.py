@@ -317,17 +317,24 @@ def _classify_cut_warning(msg: str) -> dict:
 
 
 def _declared_omission(edl: dict, source: str, start: float, end: float) -> bool:
-    """True if the EDL's `omissions` array explicitly covers [start,end] for
-    this source with a non-empty reason. A declared omission is the editor
-    saying 'I know there is speech here and I am cutting it on purpose' -- it
-    suppresses the removed-speech warning for that span (but never a mid-word
-    clip). This is what lets `pipeline.py` run without ever passing --force."""
+    """True if an `omissions` entry for this source, with a non-empty reason,
+    OVERLAPS the removed span [start,end].
+
+    The check is "acknowledged", not "exactly bounded". A between-ranges gap
+    IS the cut -- its exact endpoints come from where the editor put the two
+    range boundaries. Requiring the omission's start/end to match those to
+    the decimal is bureaucratic friction that a token-limited model keeps
+    failing (it declares the *content* span -- "the 'Uh, so,' bridge" -- not
+    the arithmetic gap between its ranges). An omission that names any part
+    of the gap proves the editor saw it; that's what defeats the failure
+    this guards against (2026-09-07: a cut made believing a span was silent).
+    Mid-word clips are never covered by this -- those still always fail."""
     for o in edl.get("omissions", []) or []:
         try:
             if (o.get("source") == source
                     and str(o.get("reason", "")).strip()
-                    and float(o["start"]) <= start + WORD_CLIP_TOLERANCE_S
-                    and float(o["end"]) >= end - WORD_CLIP_TOLERANCE_S):
+                    and float(o["start"]) < end - WORD_CLIP_TOLERANCE_S
+                    and float(o["end"]) > start + WORD_CLIP_TOLERANCE_S):
                 return True
         except (KeyError, TypeError, ValueError):
             continue
