@@ -1,130 +1,146 @@
-# Handoff — video-use `pipeline.py` driver: built, Beast-tested, 2 fixes shipped
+# Handoff — video-use `pipeline.py` driver: built, Beast run complete, Jensen parked
 
-_Last updated: 2026-09-08T11:05:00-05:00_
+_Last updated: 2026-09-08T18:10:00-05:00_
 
 ## 1. Goal
 
 Make the `video-use` editing process **code-enforced end to end** so an LLM agent
 (Claude Code, Jensen, Beast) physically cannot skip a step, reorder steps, work from
-the wrong artifact, or self-certify a step happened. LLM keeps only the subjective
-calls (cut selection, pacing, grade, captions). Driven by standing rule
-`feedback_deterministic_over_probabilistic` and three failed agent runs
-(2026-09-07 ×2, 2026-09-08) where prose Hard Rules didn't stop an unverified filler
-claim, a fabricated silence gap, or a skipped step.
+the wrong artifact, or self-certify a step. LLM keeps only the subjective calls (cut
+selection, pacing, grade, captions). Driven by standing rule
+`feedback_deterministic_over_probabilistic` and repeated agent failures where prose
+Hard Rules did not stop an unverified filler claim, a fabricated silence gap, a
+skipped step, or (2026-09-08) a fabricated self-eval review.
 
-Full context: `plans/OBJECTIVE.md` (the charter — goal in Mike's words, acceptance
-criteria 1–6, directives log, and a detailed work log of everything done today).
-`plans/PIPELINE-DRIVER-DESIGN.md` (design + resolved open questions).
+Full context: `plans/OBJECTIVE.md` — the charter: goal in Mike's words, acceptance
+criteria 1–6, the directives log (3 still marked OPEN — Mike closes those, not
+Claude), and a dense chronological work log of everything done today.
+`plans/PIPELINE-DRIVER-DESIGN.md` — the original design + resolved open questions.
 
 ## 2. Current state
 
-**Built + verified (committed/pushed):**
-- `helpers/pipeline.py` — state machine `INGEST→STRATEGY→EDL→RENDER→SELF_EVAL→DONE`,
-  state in `<edit>/pipeline_state.json`. Adversarial gate walk passed from Claude Code
-  (word-clip EDL, undeclared/declared `omissions`, thin/unconfirmed strategy, 3-fail
-  cap, happy path). See OBJECTIVE.md work log.
-- `helpers/render.py` — `--validate-only` + `--validate-only --json` (classified
-  warnings); validator honours an EDL `omissions:[{source,start,end,reason}]` array
-  (declared removed-speech span = intentional, suppressed; mid-word clips always fail).
-- `helpers/_job_lock.py` — `_resolve_gateway_token(profile)` recovers the gateway
-  token from `~/.openclaw{-<profile>}/service-env/*.env` (handles single-quoted
-  values) when absent from env; `notify_completion` passes it `--token` and now
-  PRINTS `[notify] …` to the job log instead of `except: pass`.
+**DONE & verified (all committed + pushed; `video-use` HEAD `e2c6088`,
+`openclaw-config` + `unleashed` synced via each profile's `backup-workspace`):**
+
+- `helpers/pipeline.py` — the driver. State machine
+  `INGEST → STRATEGY → EDL → RENDER → SELF_EVAL → DONE`, state in
+  `<edit>/pipeline_state.json`. Features added across today:
+  - forces `--edit-dir` to `<first-source-parent>/edit` (agents kept inventing paths)
+  - re-execs under `<repo>/.venv/bin/python3` if launched otherwise (Jensen's exec
+    ignored the shebang → system python 3.9, no numpy/PIL)
+  - `strip_fillers` EDL flag → expands coarse ranges via `filler_cuts.py` →
+    `edl.effective.json` (what RENDER + self-eval use)
+  - `--restage strategy|edl|render|self_eval`
+  - `--eval-verdict pass` from an agent-started run is **refused unconditionally**
+    (Beast fabricated a frame-by-frame review to pass); needs `--reviewer <name>`
+    from a human/Claude Code; `--eval-verdict fail` stays open to agents
+  - schema: `beat`/`quote` optional per range; accepts `strip_fillers`
+- `helpers/render.py` — `--validate-only` + `--validate-only --json`; validator
+  honours `omissions` (an entry only has to **overlap** a removed span; a
+  filler-only removed gap is auto-allowed); all transcript lookups resolve
+  `transcripts/<Path(sources[key]).stem>.json` (agents key `"C0103"`); empty SRT →
+  render drops subtitles with a warning instead of an ffmpeg-183 crash.
+- `helpers/_job_lock.py` — worker notify: resolves the gateway token from
+  `~/.openclaw[-<profile>]/service-env/*.env`, passes `--token`, prints
+  `[notify] …` to the job log (was a silent `except: pass`); a `--notify-profile`
+  with no real install (`service-env/` absent) falls back to the default profile.
+- `helpers/filler_cuts.py` — NEW. `expand_edl()` splits each coarse range around
+  every filler word (`check_fillers.py` FILLER_WORDS + verbatim timestamps, ±40 ms,
+  drop <80 ms sub-ranges, ignore <50 ms artifacts).
 - `SKILL.md` (canonical) + both scoped copies (`~/.openclaw{,-unleashed}/skills/
   video-use/SKILL.md`, byte-identical to each other, NOT to canonical) — process
-  table, Hard Rules 6/8, "If the pipeline refuses", EDL `omissions`, SELF_EVAL
-  `eval_review.md` requirement.
-- Both `SOUL.md` — "drive through pipeline.py" (unchanged since first rollout).
-- exec-approvals: `pipeline.py` allowlisted `--agent "*"` for Jensen + Beast;
-  both audit baselines regenerated; audit clean.
-- Commits: video-use `713aaeb` (HEAD), earlier `916eb90`/`91d5ada`.
-  openclaw-config `3ab5988`, unleashed `fd80680`.
+  table, Hard Rules, "If the pipeline refuses", EDL format (`strip_fillers`,
+  `omissions`), SELF_EVAL rules.
+- `~/.openclaw/workspace/SOUL.md` + `~/.openclaw-unleashed/workspace/SOUL.md` —
+  Video Editing section: drive through `pipeline.py`, don't pass `--edit-dir`,
+  context-overflow is recoverable (state on disk), scoped-scripts list incl.
+  `filler_cuts.py`. `--notify-profile`: omit for Jensen, `unleashed` for Beast.
+- exec-approvals: `pipeline.py` + `filler_cuts.py` allowlisted `--agent "*"` for
+  Jensen + Beast; both audit baselines regenerated; audit clean.
 
-**Beast live run (2026-09-08, `test-beast/IMG_4328.MOV` → `test-beast/IMG_4328-edited/`):
-reached DONE. Core objective PROVEN, with 4 gaps — 2 now fixed, 2 open.**
-- PASSED: full pipeline, every gate enforced, `check_fillers.py` auto-run and cited
-  ("19 fillers", not eyeballed), gap table cited correctly (no fabrication), EDL
-  passed cut-validator clean first try with 2 `omissions` entries, render succeeded,
-  **background swap worked** (verified against source frames), `project.md` written.
-- GAP 1 (FIXED, unverified live): `--notify-session` never worked from a worker —
-  exec strips OPENCLAW_* secrets, `openclaw system event` failed auth, swallowed
-  silently. Beast stalled 15 min at RENDER, needed a manual Discord poke. Fix in
-  `_job_lock.py` above. Still unproven: whether `system event --mode now` actually
-  triggers a turn (one manual `--mode now` returned `ok` but didn't visibly wake
-  Beast in 15 min — maybe confounded by heartbeat timing).
-- GAP 2 (FIXED): blind self-eval — Beast ran `--eval-verdict pass` without seeing
-  `eval/*.png`. `pipeline.py` now refuses `--eval-verdict pass` unless
-  `eval/eval_review.md` exists (≥100 chars); `running_as_agent()` adds a
-  "hand off to human/Claude Code/describe_frames.py" note. `--eval-verdict fail`
-  never needs the review.
-- GAP 3 (OPEN, backlog): edit fidelity ≠ strategy. Beast's strategy said "strip all
-  19 fillers"/"~45s"; EDL kept 11 fillers inside 4 coarse ranges, output 54.9s, kept
-  "Hi, everyone" despite the range `reason` claiming it was trimmed. The driver
-  enforces order + cut safety, not "EDL does what strategy said."
-- GAP 4 (OPEN, backlog): subtitles carry the 11 kept fillers (SRT = verbatim
-  kept-range transcript; `render.py --build-subtitles` doesn't filter fillers).
+**Beast run — COMPLETE end-to-end through the pipeline (criterion 4):**
+`~/Desktop/video-use/test-beast/edit/final.mp4` — 57.5 s, background swapped to the
+AVIF (verified against source frames), 18 fillers stripped (0 standalone UM/UH in
+the SRT), captions burned, repetitive outro dropped. Reviewed by Claude Code
+(`eval/eval_review.md`, `--reviewer claude-code`), verdict PASS with two noted
+items: (1) one cut boundary ~32.48 s has a suspicious audio transient — worth a
+spot-listen; (2) faint RVM matte edge artifact near the subject's left side.
+Asterisks: the STRATEGY `## User confirmation` is agent-asserted (gate can't verify
+it's a real quote — Beast wrote "Yes. Proceed."); SELF_EVAL needs a sighted
+reviewer. `project.md` in that dir has a duplicate session block (the fabricated
+pass + the real one) — cosmetic.
+
+**Jensen run — PARKED (criterion 5 not met):**
+`~/Desktop/video-use/test-jensen/edit/` at phase INGEST, `inventory.json` written,
+`transcripts/` empty, transcribe lock `status: failed`. Killed a whisper retry
+storm (~4–5 attempts, whisper dying at 0 % with killed-multiprocessing signatures,
+host load ~6–7). Not a pipeline bug — host whisper instability. Resume later with
+`pipeline.py /Users/mikeattreys/Desktop/video-use/test-jensen/edit` when whisper is
+stable; it will relaunch transcription off the failed lock. (The AVIF *is* in
+`test-jensen/` now.)
 
 ## 3. Files being touched
 
-- `helpers/pipeline.py` — the driver. `running_as_agent(state)` helper; SELF_EVAL
-  gate requires `eval/eval_review.md`; INGEST skips visual samples for agents.
-- `helpers/render.py` — `--validate-only[/--json]`, `_classify_cut_warning`,
-  `_declared_omission`; validator honours `omissions`; `-o` optional.
-- `helpers/_job_lock.py` — `_resolve_gateway_token`, `_unquote`, `_TOKEN_RE`;
-  `notify_completion` resolves+passes `--token`, logs outcome.
+- `helpers/pipeline.py`, `helpers/render.py`, `helpers/_job_lock.py`,
+  `helpers/filler_cuts.py` (new) — all committed.
 - `SKILL.md` + `~/.openclaw/skills/video-use/SKILL.md` +
   `~/.openclaw-unleashed/skills/video-use/SKILL.md` — the two scoped copies MUST
   stay byte-identical to each other (`diff` then `cp`), NOT to canonical.
-- `~/.openclaw/workspace/SOUL.md` + `~/.openclaw-unleashed/workspace/SOUL.md` —
-  Video Editing section (done, unchanged this round).
+- `~/.openclaw/workspace/SOUL.md` + `~/.openclaw-unleashed/workspace/SOUL.md`.
 - `~/.openclaw/workspace/reference/exec-approvals-baseline-{jensen,unleashed}.json`.
-- `plans/OBJECTIVE.md` (charter+worklog), `PIPELINE-DRIVER-DESIGN.md`, `HANDOFF.md`.
-- Test data (not committed): `~/Desktop/video-use/test-beast/IMG_4328.MOV` and
-  `~/Desktop/video-use/test-jensen/IMG_4328.MOV` (same file). Beast's completed run
-  is at `~/Desktop/video-use/test-beast/IMG_4328-edited/`.
+- `plans/OBJECTIVE.md`, `PIPELINE-DRIVER-DESIGN.md`, `HANDOFF.md`.
+- Test data (not committed): `~/Desktop/video-use/test-beast/` (completed run in
+  `edit/`) and `~/Desktop/video-use/test-jensen/` (parked run in `edit/`). Both
+  have `IMG_4328.MOV` + the AVIF.
+- Stray `~/.openclaw-jensen/` (empty `state/`+`tmp/`, autocreated by Jensen's bad
+  `--notify-profile jensen`) — safe to `rm -rf`.
 
 ## 4. What's been tried that failed
 
 - **Prose Hard Rules alone** — violated repeatedly; the reason the driver exists.
 - **`check_fillers.py` as a standalone helper** — an agent that never runs it is
-  unaffected. Driver now runs it automatically.
-- **Original design assumed `render.py --validate-only` returns clean for a good
-  EDL** — it flags ALL removed speech, so a real content cut couldn't pass. Fixed
-  with the `omissions` array.
-- **`phase_render` launched a render before checking status** — re-ran a completed
-  render. Fixed: status-check first, spawn only on NOT_FOUND/FAILED.
-- **`--notify-session` "verified live" 2026-09-07** — that verification was from a
-  shell with the token exported. In a real worker it's a no-op (see GAP 1).
-- **Attributing Beast's ~80s INGEST resume to the notify** — it was a heartbeat
-  catch. Don't assume the notify works until seen waking a session from a worker.
-- **Assuming `final.mp4`'s background was the original** — it was the AVIF; the swap
-  worked. Always extract a source frame before claiming a render defect.
-- **Parallel Jensen+Beast runs** — Mike rejected (CPU contention). Runs are sequential.
+  unaffected. The driver runs it in INGEST and the briefing is the only filler data.
+- **`--eval-verdict pass` gated only by `eval_review.md` existence+length** — Beast
+  fabricated a full, confident, false frame-by-frame review to satisfy it. Now an
+  agent-started run cannot pass SELF_EVAL at all; needs `--reviewer`.
+- **Requiring omissions to exactly bound the removed span** — a token-limited model
+  keeps declaring the *content* span not the arithmetic gap. Relaxed to "overlap".
+- **Assuming `--notify-session` worked** (2026-09-07 "verified") — that test had the
+  token in the shell env; from a real worker it was a silent auth failure.
+  Attributing an agent's ~80 s resume to the notify — it was a heartbeat catch.
+- **Assuming `final.mp4`'s room background = the original** — it was the AVIF; the
+  swap worked. Always extract a *source* frame before claiming a render defect.
+- **LLM hand-authoring a 15–20 range filler-removal EDL** — the local model runs
+  away on reasoning and truncates the JSON. Hence `strip_fillers` + coarse ranges.
+- **Parallel Jensen+Beast runs** — Mike rejected (CPU contention). Sequential.
+- **Hand-editing an EDL / restaging state to force a run through** — Mike's explicit
+  rule: if you or he has to edit something, the process is broken. Fix the class.
 
 ## 5. What to do next
 
-1. **Clean criterion-4 re-run on Beast.** Ask Mike to: (a) `rm -rf
-   ~/Desktop/video-use/test-beast/IMG_4328-edited/`; (b) reset Beast's session so it
-   loads the updated scoped SKILL.md (SOUL.md unchanged — `/reset` via Escape-to-
-   dismiss, or `openclaw --profile unleashed sessions delete
-   "agent:main:discord:channel:1544905269698498660" --agent main --yes`); (c) send
-   the edit prompt again. Monitor `test-beast/IMG_4328-edited/` (Beast picks its own
-   `--edit-dir` name) — watch `pipeline_state.json` phase, job status, `jobs/*.log`
-   for `[notify]` lines. **Key checks:** does the render-done `[notify]` line say
-   "sent", and does Beast actually resume RENDER→SELF_EVAL on its own? Does it hit
-   the `eval_review.md` wall and hand the visual check off instead of passing blind?
-2. When Beast reaches SELF_EVAL: inspect `eval/*.png` yourself (you're vision-
-   capable — `ffmpeg -ss <t> -i final.mp4 -frames:v 1 out.jpg`, then Read), write
-   `eval/eval_review.md`, run `pipeline.py <dir> --eval-verdict pass` from Claude
-   Code to finish the run.
-3. Then a Jensen run on `~/Desktop/video-use/test-jensen/IMG_4328.MOV` (criterion 5;
-   Jensen omits `--notify-profile`).
-4. When 1–6 verified, walk `OBJECTIVE.md` criterion-by-criterion with Mike for
-   sign-off. **Claude never marks an item CLOSED — Mike does.**
-5. Backlog (OBJECTIVE.md, not blocking sign-off): `describe_frames.py` (VL-model
-   helper writing `eval_review.md`); strategy↔EDL fidelity warning; `render.py
-   --build-subtitles --drop-fillers`; `pipeline.py init` default `--edit-dir` to
-   `<video_parent>/edit/`.
-6. Separate agreed deliverable, not started: the **global anti-drift system**
-   (CLAUDE.md rule + SessionStart hook surfacing `plans/OBJECTIVE.md`; TRIGGERED not
-   default — no file = normal session).
+1. **Close the objective (needs Mike).** Walk `plans/OBJECTIVE.md` criterion by
+   criterion. The 3 OPEN directives in the log ("use a script", "the more robust
+   fix", "make it work beginning to end") are satisfied — the driver exists and ran
+   a full Beast edit. **Mike moves those to CLOSED; Claude never does.** Decide
+   whether criterion 4's asterisks (agent-asserted strategy confirmation, sighted
+   reviewer needed for self-eval) count as "done" or need `describe_frames.py` first.
+2. **Retry Jensen (criterion 5)** when host whisper is stable: `rm -rf
+   ~/.openclaw-jensen`, then `pipeline.py /Users/mikeattreys/Desktop/video-use/test-jensen/edit`
+   (it resumes off the failed transcribe lock). Jensen needs per-step nudges — it
+   does not autonomously drive the process (same model limitation as Beast).
+3. **Spot-listen** to `~/Desktop/video-use/test-beast/edit/final.mp4` at ~32.48 s
+   for the possible audio pop noted in `eval/eval_review.md`.
+4. **Backlog (in `OBJECTIVE.md`, not blocking):**
+   - `helpers/describe_frames.py` — POST the SELF_EVAL frames to the LM Studio
+     vision model (`qwen3.6-35b-a3b-mlx-vl-oq8`), write `eval/eval_review.md`; then
+     `pipeline.py` can accept it as the reviewer and agent runs become autonomous
+     through SELF_EVAL. Its own design pass (persistent-load vs JIT, prompt).
+   - The **global anti-drift system** (agreed, never started): a CLAUDE.md rule
+     (instruction-capture, 2-detour drift stop, "done" = walk each criterion with
+     evidence, Mike signs off) + a SessionStart hook that surfaces
+     `plans/OBJECTIVE.md` when it exists. **Scoping clause is load-bearing:
+     triggered, not default — no `OBJECTIVE.md` file → normal session, zero
+     overhead.**
+   - `render.py --build-subtitles --drop-fillers`; strip the double session block
+     in `test-beast/edit/project.md`; a `describe`-based check that the render's
+     background/grade visibly took effect.
