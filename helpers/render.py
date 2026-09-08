@@ -271,11 +271,13 @@ def extract_segment(
 WORD_CLIP_TOLERANCE_S = 0.25
 
 
-def _load_transcript_words(edit_dir: Path, source_name: str,
-                            edl: dict | None = None) -> list[dict] | None:
-    # transcripts are named by the SOURCE FILE's stem, not by whatever key
-    # the EDL used for it (agents copy "C0103" from the format example). Try
-    # the key, then the file stem from edl["sources"][key].
+def _resolve_transcript_path(edit_dir: Path, source_name: str,
+                             edl: dict | None = None) -> Path | None:
+    """`transcripts/<name>.json` — resolved by the SOURCE FILE's stem, not
+    whatever key the EDL used for it (agents copy "C0103" from the format
+    example while the file/transcript is IMG_4328). Tries the key, then
+    Path(edl["sources"][key]).stem. Every transcript lookup in this module
+    must go through here."""
     candidates = [source_name]
     if edl:
         p = (edl.get("sources") or {}).get(source_name)
@@ -284,12 +286,20 @@ def _load_transcript_words(edit_dir: Path, source_name: str,
     for name in candidates:
         path = edit_dir / "transcripts" / f"{name}.json"
         if path.exists():
-            try:
-                data = json.loads(path.read_text())
-            except Exception:
-                return None
-            return [w for w in data.get("words", []) if w.get("type", "word") == "word"]
+            return path
     return None
+
+
+def _load_transcript_words(edit_dir: Path, source_name: str,
+                            edl: dict | None = None) -> list[dict] | None:
+    path = _resolve_transcript_path(edit_dir, source_name, edl)
+    if path is None:
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return None
+    return [w for w in data.get("words", []) if w.get("type", "word") == "word"]
 
 
 def _classify_cut_warning(msg: str) -> dict:
@@ -555,9 +565,6 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
     - UPPERCASE text
     - Output times computed as word.start - segment_start + segment_offset
     """
-    transcripts_dir = edit_dir / "transcripts"
-    sources = edl["sources"]
-
     entries: list[tuple[float, float, str]] = []
     seg_offset = 0.0
 
@@ -567,8 +574,8 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
         seg_end = float(r["end"])
         seg_duration = seg_end - seg_start
 
-        tr_path = transcripts_dir / f"{src_name}.json"
-        if not tr_path.exists():
+        tr_path = _resolve_transcript_path(edit_dir, src_name, edl)
+        if tr_path is None:
             print(f"  no transcript for {src_name}, skipping captions for this segment")
             seg_offset += seg_duration
             continue
@@ -948,6 +955,15 @@ def _run_render(args: argparse.Namespace, edl_path: Path, edit_dir: Path, out_pa
             if not subs_path.exists():
                 print(f"warning: subtitles path in EDL does not exist: {subs_path}")
                 subs_path = None
+    # An empty SRT makes ffmpeg's subtitles filter exit non-zero (183) and
+    # kills the whole render. If there are no cues, drop subtitles with a
+    # loud warning instead -- a captionless render beats no render.
+    if subs_path is not None:
+        srt_text = subs_path.read_text() if subs_path.exists() else ""
+        if not srt_text.strip() or "-->" not in srt_text:
+            print(f"WARNING: {subs_path.name} has no cues — rendering WITHOUT subtitles. "
+                  f"(Check that the source transcript resolved; see 'no transcript for' above.)")
+            subs_path = None
 
     # 4. Composite (overlays + subtitles LAST) → intermediate (pre-loudnorm) path
     overlays = edl.get("overlays") or []

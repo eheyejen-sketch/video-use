@@ -262,3 +262,22 @@ Beast would run, deterministic result.)
 
 SKILL.md (canonical + scoped, synced): omissions wording = "overlap, approximate
 start/end are fine".
+
+## Render failed on the C0103 key — round 2 of the same class (2026-09-08 ~16:54)
+
+The stem-resolution fix reached the cut-validator but NOT render.py's SRT builder
+(`build_master_srt` line ~570 still did `transcripts/<edl-key>.json`). Result:
+"no transcript for C0103" ×16 → `master.srt (0 cues)` → ffmpeg's subtitles filter
+exits 183 on the empty SRT → whole render fails.
+
+Fixed at the class level:
+- `_resolve_transcript_path(edit_dir, key, edl)` — single helper, resolves
+  `transcripts/<Path(sources[key]).stem>.json` (key as fallback). `_load_transcript_words`
+  AND `build_master_srt` now both go through it. (grep-confirmed those are the only
+  two transcript lookups in render.py.)
+- Empty-SRT guard: if the built/linked SRT has no cues, render.py drops subtitles
+  with a loud WARNING instead of feeding ffmpeg an empty file and dying. A
+  captionless render beats no render.
+
+Verified: master.srt rebuilds with 94 cues (was 0); 0 standalone filler cues (the
+filler-strip carries into captions).
