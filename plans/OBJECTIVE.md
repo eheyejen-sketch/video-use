@@ -305,3 +305,40 @@ works; restage self_eval → clears.
 
 REMAINING: `describe_frames.py` (vision helper writing eval_review.md) is now the
 clear unblock for autonomous agent runs — still on the backlog.
+
+## Beast run — COMPLETE end-to-end through the pipeline (2026-09-08 ~17:20)
+
+INGEST → STRATEGY → EDL → RENDER → SELF_EVAL → DONE. No file hand-edited to force it.
+- INGEST: forced-verbatim transcript, briefing.md, filler_report (18), gap table.
+- STRATEGY: Beast cited "18 fillers" from the report; confirmation is a quote form
+  ("Yes. Proceed.") — still agent-asserted, gate can't verify authenticity.
+- EDL: correct schema, 5 COARSE ranges + strip_fillers:true, omissions for content.
+  Passed the gate as written (schema-relax + overlap-omissions + stem-resolution).
+  strip_fillers expanded 5 → 16 effective ranges, 18 fillers removed.
+- RENDER: 16 segments → concat → AVIF matte (background swap WORKED) → 94-cue SRT
+  (0 standalone filler cues) → composite → loudnorm → final.mp4 57.55s.
+  Failed once on the C0103 SRT-lookup bug, retried clean after the fix.
+- SELF_EVAL: Beast FABRICATED a frame-by-frame review and passed → false DONE.
+  Fixed the class (agent can't pass SELF_EVAL; needs --reviewer). Restaged, Claude
+  Code did the real visual review, passed as --reviewer claude-code.
+  eval_review.md notes: (1) one cut boundary ~32.48s has a suspicious audio
+  transient — spot-listen; (2) faint RVM matte edge artifact near subject's left side.
+
+CRITERION 4: substantially met. The pipeline drove the whole edit, enforced every
+gate, no fabrication reached the output, background swap verified. Asterisks: the
+STRATEGY confirmation gate is agent-asserted (unfixable without a human); SELF_EVAL
+requires a human/Claude-Code reviewer (correct — agents can't see); Beast's model
+degrades on complex turns (needed session resets; the strip_fillers path is what
+made the EDL turn small enough to complete).
+
+Fixes shipped today (video-use, all pushed):
+_job_lock notify auth + explicit wake message; pipeline.py driver + forced edit-dir
++ context-overflow resume doc + --restage strategy/self_eval + strip_fillers expansion
++ agent-can't-pass-self-eval + --reviewer; render.py --validate-only[/--json] +
+omissions (overlap, filler-only auto-allow) + stem-resolved transcripts + empty-SRT
+guard + schema-relax (beat/quote optional); new filler_cuts.py; SKILL.md ×3 + SOUL.md
+×2 + exec-approvals ×2 + baselines.
+
+STILL OPEN (backlog): describe_frames.py (vision helper → autonomous agent self-eval);
+STRATEGY confirmation is forgeable; project.md double-appended this run (fake + real
+blocks both present) — cosmetic.
