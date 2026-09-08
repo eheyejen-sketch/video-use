@@ -825,18 +825,28 @@ def print_status(state: dict) -> None:
 def do_init(argv: list[str]) -> None:
     ap = argparse.ArgumentParser(prog="pipeline.py init")
     ap.add_argument("videos", nargs="+", type=Path)
-    ap.add_argument("--edit-dir", type=Path, required=True)
+    # --edit-dir is accepted for compatibility but IGNORED unless it already
+    # equals <first-source-parent>/edit. The edit dir is always beside the
+    # source video (agents kept inventing scattered locations -- test-beast/edit,
+    # test-beast/IMG_4328-edited, ~/Desktop/video-use-edits/test-beast on three
+    # runs). The script owns the path; the agent uses whatever it prints.
+    ap.add_argument("--edit-dir", type=Path, default=None)
     ap.add_argument("--notify-session", type=str, default=None)
     ap.add_argument("--notify-profile", type=str, default=None)
     args = ap.parse_args(argv)
 
-    edit_dir = args.edit_dir.resolve()
     sources = []
     for v in args.videos:
         vp = v.resolve()
         if not vp.exists():
             sys.exit(f"source not found: {vp}")
         sources.append(str(vp))
+
+    canonical = Path(sources[0]).parent / "edit"
+    if args.edit_dir is not None and args.edit_dir.resolve() != canonical:
+        print(f"note: ignoring --edit-dir {args.edit_dir} — the edit folder always "
+              f"lives beside the source video. Using {canonical}.")
+    edit_dir = canonical
     edit_dir.mkdir(parents=True, exist_ok=True)
 
     existing = state_path(edit_dir)
@@ -856,8 +866,10 @@ def do_init(argv: list[str]) -> None:
         "gates": _fresh_gates(),
     }
     save_state(state)
-    print(f"Pipeline initialized at {edit_dir} — phase INGEST, {len(sources)} source(s).\n"
-          f"Run `pipeline.py {edit_dir}` to begin.")
+    print(f"Pipeline initialized. Edit folder: {edit_dir}\n"
+          f"(phase INGEST, {len(sources)} source(s))\n\n"
+          f"Use this exact path for every following call:\n"
+          f"    pipeline.py {edit_dir}")
 
 
 ADVANCE = {

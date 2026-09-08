@@ -135,3 +135,14 @@ case, was actually fine — but a broken matte would have sailed through identic
 
 SKILL.md (canonical + both scoped, re-synced identical) updated: SELF_EVAL row, checklist (+ "verify the
 background swap / grade actually took effect"), "If the pipeline refuses" entry.
+
+## Beast re-run #2 — 2026-09-08 13:17 (post fixes 1 & 2)
+
+- Beast invented a THIRD distinct edit-dir: `~/Desktop/video-use-edits/test-beast`
+  (run1 `test-beast/edit`, run2 `test-beast/IMG_4328-edited`, run3 this). 3/3 nonstandard.
+  Harmless functionally but breaks monitoring + scatters outputs + violates the
+  "outputs go in <videos_dir>/edit/" rule. → PROMOTE from backlog to near-term:
+  `pipeline.py init` should refuse/warn on a `--edit-dir` that isn't
+  `<first-video-parent>/edit`, OR default it and have SOUL.md say "don't pass --edit-dir".
+- Mechanics verified good: --verbatim forced, --notify-session + --notify-profile
+  unleashed present, pipeline-driven. INGEST transcription running.
