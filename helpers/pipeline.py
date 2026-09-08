@@ -254,6 +254,7 @@ def write_briefing(state: dict, inv: dict, sources: list[Path], gaps_by_src: dic
 
     packed = edit_dir / "takes_packed.md"
     filler = edit_dir / "filler_report.txt"
+    has_samples = any((edit_dir / "verify").glob("*_sample_*.png"))
 
     for s in sources:
         words = load_words(edit_dir, s)
@@ -262,10 +263,11 @@ def write_briefing(state: dict, inv: dict, sources: list[Path], gaps_by_src: dic
         parts.append("> " + raw_text(words).replace("\n", " ") + "\n")
         parts.append("### Silence-gap table (authoritative cut candidates)\n")
         parts.append(_gap_table(gaps_by_src[s.name]))
-        parts.append(f"### Visual samples\n")
-        parts.append(f"- `verify/{s.stem}_sample_head.png` (0–10s)\n"
-                     f"- `verify/{s.stem}_sample_mid.png` (midpoint ±5s)\n"
-                     f"Ask for more with `timeline_view.py` at any decision point.\n")
+        if has_samples:
+            parts.append("### Visual samples\n")
+            parts.append(f"- `verify/{s.stem}_sample_head.png` (0–10s)\n"
+                         f"- `verify/{s.stem}_sample_mid.png` (midpoint ±5s)\n"
+                         f"Ask for more with `timeline_view.py` at any decision point.\n")
 
     if packed.exists():
         parts.append("\n## Packed phrase-level transcript (`takes_packed.md`)\n")
@@ -355,13 +357,19 @@ def phase_ingest(state: dict) -> None:
         gaps_by_src[s.name] = g
     (edit_dir / "gaps.json").write_text(json.dumps(gaps_by_src, indent=2))
 
-    # 7. two auto visual samples per source
-    for s in sources:
-        dur = inv[s.name]["duration_s"] or 0.0
-        timeline_sample(s, 0.0, min(10.0, dur), edit_dir / "verify" / f"{s.stem}_sample_head.png")
-        mid = dur / 2.0
-        timeline_sample(s, max(0.0, mid - 5.0), min(dur, mid + 5.0),
-                        edit_dir / "verify" / f"{s.stem}_sample_mid.png")
+    # 7. two auto visual samples per source — skipped when running under an
+    # OpenClaw agent (Jensen/Beast run text-only models and cannot view an
+    # image anywhere; the frames are wasted ffmpeg work + an "I couldn't view
+    # this" line every run). Claude Code (no notify profile) still gets them.
+    running_as_agent = bool((state.get("notify") or {}).get("profile")
+                            or (state.get("notify") or {}).get("session_key"))
+    if not running_as_agent:
+        for s in sources:
+            dur = inv[s.name]["duration_s"] or 0.0
+            timeline_sample(s, 0.0, min(10.0, dur), edit_dir / "verify" / f"{s.stem}_sample_head.png")
+            mid = dur / 2.0
+            timeline_sample(s, max(0.0, mid - 5.0), min(dur, mid + 5.0),
+                            edit_dir / "verify" / f"{s.stem}_sample_mid.png")
 
     # 8. briefing
     write_briefing(state, inv, sources, gaps_by_src)
