@@ -101,6 +101,19 @@ def check(edit_dir: Path) -> tuple[str, list[str], list[str]]:
     if not final.exists() or final.stat().st_size == 0:
         return "ERROR", [f"{final} missing or empty"], []
 
+    # A restage that didn't re-render leaves final.mp4 older than the EDL it was
+    # supposedly built from (2026-09-09 recut bug). Catch it here regardless of
+    # how the render was (not) triggered.
+    for edl_name in ("edl.effective.json", "edl.json"):
+        ep = edit_dir / edl_name
+        try:
+            if ep.exists() and ep.stat().st_mtime > final.stat().st_mtime + 2:
+                issues.append(f"final.mp4 is OLDER than {edl_name} — the render is "
+                              f"stale, it was not rebuilt after the EDL changed")
+                break
+        except OSError:
+            pass
+
     # --- mp4 integrity -------------------------------------------------------
     vcodec = _ffprobe(final, "-select_streams", "v:0", "-show_entries", "stream=codec_name")
     acodec = _ffprobe(final, "-select_streams", "a:0", "-show_entries", "stream=codec_name")

@@ -758,6 +758,21 @@ def phase_render(state: dict) -> None:
     out_path = edit_dir / "final.mp4"
     common = [str(edl_path), "-o", str(out_path)]
 
+    # A restage to EDL leaves the previous final.mp4 + render job lock on disk;
+    # `render.py --status` would report DONE off the stale output and we'd skip
+    # re-rendering the re-cut EDL entirely (2026-09-09: a recut "completed" with
+    # the old video). If the EDL is newer than final.mp4, the render is stale --
+    # blow away the output + lock so it genuinely re-renders.
+    try:
+        stale = (out_path.exists()
+                 and edl_path.stat().st_mtime > out_path.stat().st_mtime + 1)
+    except OSError:
+        stale = False
+    if stale:
+        out_path.unlink(missing_ok=True)
+        (edit_dir / "jobs" / f"render_{out_path.stem}.json").unlink(missing_ok=True)
+        state["gates"]["render_done"]["done"] = False
+
     # Check status BEFORE launching -- render.py's launch path only skips a
     # *currently running* job, so a completed job would be re-rendered. Only
     # spawn a worker if there is no job (or a failed one) to resume.
@@ -1030,10 +1045,27 @@ def phase_done(state: dict) -> None:
 
 # ───────────────────────────── restage ──────────────────────────────
 
+def _invalidate_render(edit_dir: Path) -> None:
+    """Drop the previous render output + its job lock + the eval artifacts, so a
+    restage genuinely re-renders instead of `render.py --status` reporting DONE
+    off the stale final.mp4 (2026-09-09 recut bug)."""
+    final = edit_dir / "final.mp4"
+    final.unlink(missing_ok=True)
+    (edit_dir / f"final.prenorm.mp4").unlink(missing_ok=True)
+    (edit_dir / "jobs" / f"render_{final.stem}.json").unlink(missing_ok=True)
+    (edit_dir / "eval" / "eval_review.md").unlink(missing_ok=True)
+    ev = edit_dir / "eval"
+    if ev.is_dir():
+        for p in ev.glob("*.png"):
+            p.unlink(missing_ok=True)
+
+
 def do_restage(state: dict, target: str) -> None:
     edit_dir = Path(state["edit_dir"])
     if target in ("strategy", "edl"):
         (edit_dir / "edl.effective.json").unlink(missing_ok=True)  # stale derived cut list
+    if target in ("strategy", "edl", "render"):
+        _invalidate_render(edit_dir)
     if target == "self_eval":
         # back to SELF_EVAL: drop the verdict, the review, and the QC job state
         for f in ("eval/eval_review.md",):
@@ -1041,6 +1073,8 @@ def do_restage(state: dict, target: str) -> None:
         state["phase"] = "SELF_EVAL"
         state["gates"]["self_eval"] = {"passes": 0, "verdict": None}
         save_state(state)
+        if running_as_agent(state):
+            _spawn_watcher(edit_dir)
         print(f"Restaged to SELF_EVAL (verdict + review + QC state cleared). "
               f"Run `pipeline.py {edit_dir}` to re-run eval frames + QC.")
         sys.exit(0)
@@ -1050,6 +1084,8 @@ def do_restage(state: dict, target: str) -> None:
         for g in ("edl_validated", "render_done"):
             state["gates"][g]["done"] = False
         save_state(state)
+        if running_as_agent(state):
+            _spawn_watcher(edit_dir)
         print(f"Restaged to STRATEGY. Rewrite {state['edit_dir']}/strategy.md. "
               f"An agent-started run then auto-advances to EDL; a Claude Code run "
               f"uses `pipeline.py {state['edit_dir']} --confirm-strategy`.")
@@ -1069,6 +1105,10 @@ def do_restage(state: dict, target: str) -> None:
         print(f"REFUSED: unknown --restage target {target!r} (use strategy|edl|render)")
         sys.exit(1)
     save_state(state)
+    # An agent-started run's watcher exits at DONE; a recut needs it back so the
+    # re-render + re-QC drive themselves. `_spawn_watcher` no-ops if one is live.
+    if running_as_agent(state):
+        _spawn_watcher(edit_dir)
     print(f"Restaged to {state['phase']}. Run `pipeline.py {state['edit_dir']}` to continue.")
     sys.exit(0)
 
