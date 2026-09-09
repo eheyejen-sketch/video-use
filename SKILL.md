@@ -119,6 +119,17 @@ pipeline writes at the end of INGEST. No `briefing.md` yet means INGEST isn't
 finished; run `pipeline.py <edit-dir>` again. (2026-09-08: a woken agent read the
 raw transcript and posted "~15 uhs" instead of advancing — `check_fillers.py` never ran.)
 
+**Auto-advance watcher.** When `init` is run with `--notify-session` (i.e. by
+Jensen/Beast), a detached watcher starts and drives the mechanical phases for you:
+it runs `pipeline.py <edit-dir>` itself through INGEST and RENDER, and at STRATEGY,
+EDL, and SELF_EVAL it sends you a `system event` nudge naming the one artifact it
+needs. **When a nudge names a next action, do exactly that one thing, then stop** —
+write the file it asks for and run the command it gives, nothing more. The watcher
+re-checks on its own; you don't need to "keep going". It never writes your
+artifacts and never passes a human gate (`--confirm-strategy`, `--eval-verdict
+pass`). If it hits a retry storm, an unresponsive stretch, or its time cap it stops
+and pings the session — at that point a human is needed. Log: `<edit>/jobs/watch.log`.
+
 | Command | Phase | The driver does (no choice for you) | You owe back |
 |---|---|---|---|
 | `pipeline.py init <video>… [--notify-session K --notify-profile P]` | — | create `<video_parent>/edit/` + state; prints the path (don't pass `--edit-dir`) | — |

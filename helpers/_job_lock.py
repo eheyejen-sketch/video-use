@@ -173,18 +173,21 @@ def _resolve_gateway_token(profile: str | None) -> str | None:
     return None
 
 
-def notify_completion(session_key: str | None, profile: str | None, message: str) -> None:
-    """Wake the OpenClaw session that launched this job so the agent resumes
-    without waiting for a human prompt. A background job finishing gives the
-    agent no signal on its own -- its turn ended when the job started. This
-    fires `openclaw system event ... --mode now`.
+def send_system_event(session_key: str | None, profile: str | None, message: str) -> bool:
+    """Fire `openclaw system event ... --mode now` to wake an OpenClaw session.
+    Returns True on rc 0, False otherwise (including when session_key is unset).
 
-    No-ops (returns) when session_key is unset (Claude Code has no session to
-    notify). A notification failure never fails the job -- but unlike before
-    2026-09-08 it is NOT silent: the outcome is printed (the worker's stdout
-    is its job log), so a broken notify path is visible in jobs/<key>.log."""
+    Shared by `notify_completion` (a background job finished/failed) and
+    `pipeline.py --watch` (a phase-nudge to an idle agent). The gateway token is
+    recovered from the profile's `service-env/*.env` file because this often runs
+    as a detached grandchild of an OpenClaw `exec`, which strips OPENCLAW_*
+    secrets -- without that recovery the call silently fails auth (the bug that
+    made the whole notify path a no-op from an agent context until 2026-09-08).
+
+    Never raises: a failed wake must not fail the caller. The outcome is printed
+    (the caller's stdout is its job/watch log) so a broken path stays visible."""
     if not session_key:
-        return
+        return False
     eff = _effective_profile(profile)  # drop a --notify-profile with no config dir
     token = _resolve_gateway_token(profile)
     cmd = ["openclaw"]
@@ -199,11 +202,25 @@ def notify_completion(session_key: str | None, profile: str | None, message: str
         if r.returncode == 0:
             print(f"[notify] system event sent to {session_key}"
                   f"{'' if token else ' (no token resolved -- may have failed auth)'}")
-        else:
-            print(f"[notify] FAILED rc={r.returncode}: "
-                  f"{(r.stderr or r.stdout or '').strip()[:300]}")
+            return True
+        print(f"[notify] FAILED rc={r.returncode}: "
+              f"{(r.stderr or r.stdout or '').strip()[:300]}")
+        return False
     except Exception as e:  # noqa: BLE001 -- never let a notify failure fail the job
         print(f"[notify] FAILED (exception): {e}")
+        return False
+
+
+def notify_completion(session_key: str | None, profile: str | None, message: str) -> None:
+    """Wake the OpenClaw session that launched this job so the agent resumes
+    without waiting for a human prompt. A background job finishing gives the
+    agent no signal on its own -- its turn ended when the job started.
+
+    No-ops when session_key is unset (Claude Code has no session to notify).
+    Thin wrapper over `send_system_event`; kept as a named entry point because
+    transcribe.py / render.py call it and its intent (job lifecycle, not a
+    generic nudge) is worth naming."""
+    send_system_event(session_key, profile, message)
 
 
 def mark_done(edit_dir: Path, job_key: str, output_path: str,

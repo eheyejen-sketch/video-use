@@ -30,12 +30,21 @@ deleting the edit dir and re-running `init` starts clean.
 CLI
 ---
     pipeline.py init <video> [<video> ...] --edit-dir DIR
-                 [--notify-session KEY] [--notify-profile PROFILE]
+                 [--notify-session KEY] [--notify-profile PROFILE] [--no-watch]
     pipeline.py <edit-dir>                     # run/advance the current phase
     pipeline.py <edit-dir> --status            # report only, never mutates
     pipeline.py <edit-dir> --confirm-strategy  # STRATEGY gate
     pipeline.py <edit-dir> --eval-verdict pass|fail [--restage edl|render]
-    pipeline.py <edit-dir> --restage edl|render   # manual step-back
+    pipeline.py <edit-dir> --restage strategy|edl|render|self_eval  # manual step-back
+    pipeline.py <edit-dir> --watch            # detached auto-advance loop
+                 [--watch-max-seconds N]      #   (auto-started by an agent init)
+
+The --watch loop owns the mechanical phase transitions an idle agent keeps
+missing (INGEST/RENDER advance themselves; STRATEGY/EDL get one targeted
+`system event` nudge; SELF_EVAL is generated then handed to a sighted
+reviewer). It never authors an artifact and never passes a human gate. A
+retry storm, an unresponsive agent, or the wall-clock cap stops it and pings
+the session for a human. See `plans/AUTO-ADVANCE-DESIGN.md`.
 
 Exit codes: 0 = phase advanced / waiting on a background job / info printed
 (the agent should read the message and act). 1 = a gate REFUSED the agent's
@@ -68,6 +77,19 @@ if _VENV_PY.exists() and not os.environ.get("_VIDEO_USE_VENV_REEXEC"):
             os.execv(str(_VENV_PY), [str(_VENV_PY), str(Path(__file__).resolve()), *sys.argv[1:]])
     except OSError:
         pass  # fall through and hope the current interpreter has what's needed
+try:
+    from _job_lock import _pid_alive, send_system_event
+except ImportError:  # pragma: no cover - _job_lock is a sibling; this is belt-and-braces
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+
+    def send_system_event(*_a, **_k) -> bool:
+        return False
+
 STATE_NAME = "pipeline_state.json"
 PHASES = ["INGEST", "STRATEGY", "EDL", "RENDER", "SELF_EVAL", "DONE"]
 
@@ -917,6 +939,359 @@ def print_status(state: dict) -> None:
     print(f"\nnext:     {owed[state['phase']]}")
 
 
+# ──────────────────────────── watch mode ────────────────────────────
+#
+# `pipeline.py <edit-dir> --watch` is a detached loop that OWNS the mechanical
+# transitions an idle agent keeps failing to make. It never authors an artifact
+# and never passes a human gate (--confirm-strategy, --eval-verdict pass). It:
+#   INGEST / RENDER  -> runs `pipeline.py <dir>` itself to advance; a job that
+#                       fails MAX_CONSEC_FAIL times in a row -> stop + escalate
+#                       (this is what stops a whisper/ffmpeg retry storm).
+#   STRATEGY / EDL    -> the artifact is the agent's; fire ONE rate-limited
+#                       `system event --mode now` nudge with the exact next
+#                       action (and, for EDL, the exact validator error), keyed
+#                       so each fresh edit gets one fresh nudge.
+#   SELF_EVAL         -> generate the eval frames, nudge once for a SIGHTED
+#                       review, then exit (an agent cannot pass this phase).
+# Absolute backstops: a wall-clock cap and a per-phase driver-run cap, both of
+# which stop the watcher and ping the session for a human.
+#
+# Design note: `plans/AUTO-ADVANCE-DESIGN.md`. Open question flagged there and
+# still true — whether `system event --mode now` reliably triggers an agent turn
+# (a manual one did not visibly wake Beast on 2026-09-08). Every nudge's outcome
+# is logged to jobs/watch.log so the first real run answers it.
+
+POLL_INTERVAL_S = 20
+WATCH_MAX_S = 5400            # 90 min absolute cap on a single watch
+NUDGE_COOLDOWN_S = 300        # min seconds between two identical nudges
+MAX_NUDGES_PER_PHASE = 6      # after this: stop (write phases) / go quiet (confirm)
+MAX_CONSEC_FAIL = 2           # INGEST/RENDER: 1 failure + 1 retry, then stop
+MAX_DRIVER_RUNS_PER_PHASE = 60  # ~20 min of polling without advancing -> stop
+STATE_SETTLE_S = 12           # skip a cycle if the state file changed this recently
+
+
+def _watch_paths(edit_dir: Path):
+    jobs = edit_dir / "jobs"
+    jobs.mkdir(parents=True, exist_ok=True)
+    return jobs / "watch.lock", jobs / "watch_state.json", jobs / "watch.log"
+
+
+def _read_json(p: Path):
+    try:
+        return json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _wlog(msg: str) -> None:
+    # the watcher's stdout is redirected to jobs/watch.log by the spawner;
+    # when run in the foreground this just prints to the terminal.
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+
+def _run_driver(edit_dir: Path) -> subprocess.CompletedProcess:
+    """Invoke the driver exactly as an agent would: `pipeline.py <dir>`. The
+    child skips the venv re-exec (this process already is the venv python)."""
+    return subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), str(edit_dir)],
+        capture_output=True, text=True,
+        env={**os.environ, "_VIDEO_USE_VENV_REEXEC": "1"},
+    )
+
+
+def _nudge(session_key, profile, text: str) -> bool:
+    try:
+        ok = send_system_event(session_key, profile, text)
+    except Exception as e:  # noqa: BLE001
+        _wlog(f"nudge raised: {e!r}")
+        return False
+    _wlog(f"nudge sent={ok}: {text.splitlines()[0][:120]}")
+    return ok
+
+
+def _nudge_gate(wstate: dict, key: str, cooldown: int = NUDGE_COOLDOWN_S):
+    """True = send now, False = still cooling down, None = nudge budget for this
+    key is exhausted (caller decides: stop, or just stay quiet)."""
+    rec = wstate["nudges"].get(key)
+    now = time.time()
+    if rec is None:
+        return True
+    count, last = rec
+    if count >= MAX_NUDGES_PER_PHASE:
+        return None
+    return (now - last) >= cooldown
+
+
+def _nudge_mark(wstate: dict, key: str) -> None:
+    rec = wstate["nudges"].get(key) or [0, 0.0]
+    wstate["nudges"][key] = [rec[0] + 1, time.time()]
+
+
+_STRATEGY_NUDGE = (
+    "video-use pipeline for {edit} is at STRATEGY and waiting on you. Read "
+    "{edit}/briefing.md in full, discuss the edit with the user, then write "
+    "{edit}/strategy.md (4-8 sentences: shape, cut direction, length target, "
+    "grade, subtitle style) with a `## User confirmation` section quoting the "
+    "user's plain-English approval. Then run:  pipeline.py {edit} --confirm-strategy"
+    "  — do only that, then stop."
+)
+_STRATEGY_CONFIRM_NUDGE = (
+    "video-use pipeline for {edit}: strategy.md is written and needs the user's "
+    "approval recorded in a `## User confirmation` section, then:  "
+    "pipeline.py {edit} --confirm-strategy  . The watcher will not run that step "
+    "for you — it is human-gated."
+)
+_EDL_NUDGE = (
+    "video-use pipeline for {edit} is at EDL and waiting on you. Write "
+    "{edit}/edl.json per SKILL.md 'EDL format' — coarse structural ranges "
+    "(source/start/end/reason each); set \"strip_fillers\": true to drop filler "
+    "words; use `omissions` for deliberate content cuts. Then run:  "
+    "pipeline.py {edit}  — do only that, then stop; the watcher renders from there."
+)
+_EDL_REJECT_NUDGE = (
+    "video-use pipeline for {edit}: edl.json was NOT accepted —\n\n{err}\n\n"
+    "Fix {edit}/edl.json and stop. The watcher re-checks automatically."
+)
+_SELF_EVAL_NUDGE = (
+    "video-use render for {edit} is done; eval frames are in {edit}/eval/. This "
+    "phase needs a SIGHTED review — an agent cannot pass it. A human or Claude "
+    "Code must inspect eval/*.png, write {edit}/eval/eval_review.md, then run:  "
+    "pipeline.py {edit} --eval-verdict pass --reviewer <name>  . The watcher is "
+    "stopping now; the pipeline is safely parked here."
+)
+
+
+def do_watch(edit_dir: Path, max_seconds: int) -> None:
+    edit_dir = edit_dir.resolve()
+    lock_file, wstate_file, _log = _watch_paths(edit_dir)
+
+    if not state_path(edit_dir).exists():
+        print(f"no {STATE_NAME} in {edit_dir} — nothing to watch. Run `init` first.")
+        return
+
+    other = _read_json(lock_file)
+    if other and other.get("pid") and _pid_alive(other["pid"]) and other["pid"] != os.getpid():
+        print(f"watcher already running for {edit_dir} (pid {other['pid']}); exiting.")
+        return
+
+    st0 = _read_json(state_path(edit_dir)) or {}
+    if st0.get("phase") == "DONE":
+        print(f"pipeline for {edit_dir} is already DONE; not starting a watcher.")
+        return
+
+    lock_file.write_text(json.dumps({"pid": os.getpid(), "started_at": time.time()}))
+    wstate = _read_json(wstate_file) or {}
+    wstate.setdefault("started_at", time.time())
+    wstate.setdefault("nudges", {})          # "PHASE:tag[:mtime]" -> [count, last_ts]
+    wstate.setdefault("consec_fail", {})     # "INGEST"/"RENDER"   -> int
+    wstate.setdefault("driver_runs", {})     # PHASE               -> int
+    wstate.pop("stopped", None)
+    wstate.pop("stopped_reason", None)
+
+    def persist() -> None:
+        wstate_file.write_text(json.dumps(wstate, indent=2))
+
+    def stop(reason: str, ping: bool = True) -> None:
+        wstate["stopped"] = True
+        wstate["stopped_reason"] = reason
+        wstate["stopped_at"] = time.time()
+        persist()
+        lock_file.unlink(missing_ok=True)
+        _wlog(f"STOP: {reason}")
+        if ping:
+            st = _read_json(state_path(edit_dir)) or {}
+            n = st.get("notify") or {}
+            if n.get("session_key"):
+                _nudge(n["session_key"], n.get("profile"),
+                       f"video-use watcher for {edit_dir} has STOPPED: {reason}. "
+                       f"It needs manual attention — run  pipeline.py {edit_dir} --status  "
+                       f"and check {edit_dir}/jobs/ .")
+
+    deadline = time.time() + max_seconds
+    _wlog(f"watcher up (pid {os.getpid()}); cap {max_seconds}s, poll {POLL_INTERVAL_S}s, "
+          f"phase {st0.get('phase')}")
+
+    def nap() -> None:
+        time.sleep(max(1.0, min(POLL_INTERVAL_S, deadline - time.time())))
+
+    while True:
+        if time.time() > deadline:
+            stop(f"wall-clock cap ({max_seconds}s) reached without finishing")
+            return
+
+        st = _read_json(state_path(edit_dir))
+        if st is None:
+            stop(f"{STATE_NAME} disappeared (edit dir deleted?)", ping=False)
+            return
+        phase = st.get("phase")
+        n = st.get("notify") or {}
+        skey, prof = n.get("session_key"), n.get("profile")
+
+        if phase == "DONE":
+            _wlog("pipeline reached DONE — watcher exiting")
+            wstate["stopped"] = True
+            wstate["stopped_reason"] = "pipeline DONE"
+            persist()
+            lock_file.unlink(missing_ok=True)
+            return
+
+        if wstate["driver_runs"].get(phase, 0) > MAX_DRIVER_RUNS_PER_PHASE:
+            stop(f"phase {phase} did not advance after {MAX_DRIVER_RUNS_PER_PHASE} "
+                 f"driver attempts")
+            return
+
+        try:
+            settle = time.time() - state_path(edit_dir).stat().st_mtime
+        except OSError:
+            settle = 999
+        if settle < STATE_SETTLE_S:
+            # the agent (or a prior cycle) just wrote state; let it breathe
+            nap()
+            continue
+
+        result = None
+        try:
+            if phase == "INGEST":
+                result = _watch_job_phase(edit_dir, wstate, "INGEST", "STRATEGY",
+                                          "INGEST FAILED")
+            elif phase == "STRATEGY":
+                result = _watch_strategy(edit_dir, st, wstate, skey, prof)
+            elif phase == "EDL":
+                result = _watch_edl(edit_dir, st, wstate, skey, prof)
+            elif phase == "RENDER":
+                result = _watch_job_phase(edit_dir, wstate, "RENDER", "SELF_EVAL",
+                                          "RENDER FAILED")
+            elif phase == "SELF_EVAL":
+                result = _watch_self_eval(edit_dir, wstate, skey, prof)
+            else:
+                _wlog(f"unknown phase {phase!r}; idling")
+        except Exception as e:  # noqa: BLE001 - a loop bug must not kill the watcher silently
+            _wlog(f"loop error in {phase}: {e!r}")
+
+        persist()
+        if isinstance(result, tuple) and result and result[0] == "stop":
+            stop(result[1])
+            return
+        if result == "exit":
+            wstate["stopped"] = True
+            wstate["stopped_reason"] = "handed off at SELF_EVAL"
+            persist()
+            lock_file.unlink(missing_ok=True)
+            return
+        nap()
+
+
+def _watch_job_phase(edit_dir: Path, wstate: dict, phase: str, next_phase: str,
+                     fail_marker: str):
+    """INGEST / RENDER: run the driver; it launches / polls / advances the
+    background job. A run of MAX_CONSEC_FAIL consecutive failures -> stop."""
+    r = _run_driver(edit_dir)
+    wstate["driver_runs"][phase] = wstate["driver_runs"].get(phase, 0) + 1
+    out = (r.stdout or "") + (r.stderr or "")
+
+    now = _read_json(state_path(edit_dir)) or {}
+    if now.get("phase") == next_phase:
+        _wlog(f"{phase} -> {next_phase}")
+        wstate["consec_fail"][phase] = 0
+        return None
+
+    failed = r.returncode == 2 or fail_marker in out or out.lstrip().startswith("RENDER FAILED")
+    if failed:
+        c = wstate["consec_fail"].get(phase, 0) + 1
+        wstate["consec_fail"][phase] = c
+        _wlog(f"{phase} job failed ({c}/{MAX_CONSEC_FAIL}): {out.strip()[:200]}")
+        if c >= MAX_CONSEC_FAIL:
+            return ("stop", f"{phase} background job failed {c} times in a row: "
+                            f"{out.strip()[:280]}")
+        return None
+
+    wstate["consec_fail"][phase] = 0
+    _wlog(f"{phase} in progress: {out.strip()[:160]}")
+    return None
+
+
+def _watch_strategy(edit_dir: Path, st: dict, wstate: dict, skey, prof):
+    sp = edit_dir / "strategy.md"
+    if st["gates"]["strategy_confirmed"]["done"]:
+        return None  # phase should already be EDL; nothing to do
+    if not sp.exists():
+        g = _nudge_gate(wstate, "STRATEGY:write")
+        if g is None:
+            return ("stop", f"agent never wrote strategy.md after "
+                            f"{MAX_NUDGES_PER_PHASE} nudges")
+        if g:
+            _nudge(skey, prof, _STRATEGY_NUDGE.format(edit=edit_dir))
+            _nudge_mark(wstate, "STRATEGY:write")
+        return None
+    # written but not confirmed -> human-gated; nudge slowly, never stop on it
+    if _nudge_gate(wstate, "STRATEGY:confirm", cooldown=1800):
+        _nudge(skey, prof, _STRATEGY_CONFIRM_NUDGE.format(edit=edit_dir))
+        _nudge_mark(wstate, "STRATEGY:confirm")
+    return None
+
+
+def _watch_edl(edit_dir: Path, st: dict, wstate: dict, skey, prof):
+    ep = edit_dir / "edl.json"
+    if not ep.exists():
+        g = _nudge_gate(wstate, "EDL:write")
+        if g is None:
+            return ("stop", f"agent never wrote edl.json after {MAX_NUDGES_PER_PHASE} nudges")
+        if g:
+            _nudge(skey, prof, _EDL_NUDGE.format(edit=edit_dir))
+            _nudge_mark(wstate, "EDL:write")
+        return None
+
+    r = _run_driver(edit_dir)
+    wstate["driver_runs"]["EDL"] = wstate["driver_runs"].get("EDL", 0) + 1
+    now = _read_json(state_path(edit_dir)) or {}
+    if now.get("phase") == "RENDER":
+        _wlog("EDL -> RENDER (validated)")
+        return None
+
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    try:
+        mtime = int(ep.stat().st_mtime)
+    except OSError:
+        mtime = 0
+    key = f"EDL:reject:{mtime}"  # one fresh nudge per fresh edit of edl.json
+    g = _nudge_gate(wstate, key, cooldown=120)
+    if g:
+        _nudge(skey, prof, _EDL_REJECT_NUDGE.format(edit=edit_dir, err=out[:1200]))
+        _nudge_mark(wstate, key)
+    elif g is None:
+        _wlog("EDL still rejected; nudge budget for this revision exhausted, idling")
+    return None
+
+
+def _watch_self_eval(edit_dir: Path, wstate: dict, skey, prof):
+    # generate the eval frames (verdict=None path), nudge once, then hand off:
+    # an agent-started run structurally cannot pass this phase.
+    r = _run_driver(edit_dir)
+    wstate["driver_runs"]["SELF_EVAL"] = wstate["driver_runs"].get("SELF_EVAL", 0) + 1
+    if r.returncode not in (0,):
+        _wlog(f"SELF_EVAL frame gen rc={r.returncode}: {(r.stdout + r.stderr).strip()[:200]}")
+    _nudge(skey, prof, _SELF_EVAL_NUDGE.format(edit=edit_dir))
+    _nudge_mark(wstate, "SELF_EVAL:review")
+    _wlog("SELF_EVAL: frames generated, review nudge sent, watcher handing off")
+    return "exit"
+
+
+def _spawn_watcher(edit_dir: Path) -> None:
+    _, _, log = _watch_paths(edit_dir)
+    try:
+        with open(log, "a") as lf:
+            subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), str(edit_dir), "--watch"],
+                stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                env={**os.environ, "_VIDEO_USE_VENV_REEXEC": "1"},
+            )
+        print(f"auto-advance watcher started (log: {log}).")
+    except OSError as e:
+        print(f"note: could not start the auto-advance watcher ({e}); the pipeline "
+              f"still works, it just won't self-advance between phases.")
+
+
 # ────────────────────────────── main ────────────────────────────────
 
 def do_init(argv: list[str]) -> None:
@@ -930,6 +1305,11 @@ def do_init(argv: list[str]) -> None:
     ap.add_argument("--edit-dir", type=Path, default=None)
     ap.add_argument("--notify-session", type=str, default=None)
     ap.add_argument("--notify-profile", type=str, default=None)
+    # An agent-started run (a --notify-session is present) gets a detached
+    # auto-advance watcher unless this is passed. A Claude Code run never does
+    # (it drives the pipeline interactively; a background loop racing on the
+    # same state file would just be confusing).
+    ap.add_argument("--no-watch", action="store_true")
     args = ap.parse_args(argv)
 
     sources = []
@@ -968,6 +1348,9 @@ def do_init(argv: list[str]) -> None:
           f"Use this exact path for every following call:\n"
           f"    pipeline.py {edit_dir}")
 
+    if args.notify_session and not args.no_watch:
+        _spawn_watcher(edit_dir)
+
 
 ADVANCE = {
     "INGEST": lambda st: phase_ingest(st),
@@ -997,9 +1380,19 @@ def main() -> None:
                          "pass` an agent-started run; a text-only agent cannot supply it "
                          "honestly and must hand off)")
     ap.add_argument("--restage", choices=["strategy", "edl", "render", "self_eval"], default=None)
+    ap.add_argument("--watch", action="store_true",
+                    help="run the detached auto-advance loop for this edit dir "
+                         "(started automatically by an agent `init`; safe to run by hand)")
+    ap.add_argument("--watch-max-seconds", type=int, default=WATCH_MAX_S,
+                    help=f"wall-clock cap for a single --watch (default {WATCH_MAX_S})")
     args = ap.parse_args(argv)
 
     edit_dir = args.edit_dir.resolve()
+
+    if args.watch:
+        do_watch(edit_dir, args.watch_max_seconds)
+        return
+
     state = load_state(edit_dir)
     state["edit_dir"] = str(edit_dir)  # tolerate a moved dir
 

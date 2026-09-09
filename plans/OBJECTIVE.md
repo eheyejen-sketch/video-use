@@ -383,3 +383,84 @@ direct → no loop.
 
 Jensen's in-flight transcribe (already running under 3.9) will limp to completion;
 its next `pipeline.py <dir>` call re-execs correctly and the rest of the run is fine.
+
+## Model research + auto-advance design (2026-09-08 evening)
+
+Mike asked: test Llama 3.3 70B and Qwen3.5-122B-A10B on the evals, then design the
+auto-advance mechanism; also recommend a model better at multi-step long-running
+tasks (open-source, self-hostable on the Mac Studio, free).
+
+Model finding: BOTH already run 2026-08-31 (`~/github/openclaw-config/model-eval/
+runs/results2_{llama33,qwen122}.json`, `results/tier1-2026-08-31/SUMMARY.md`).
+- Llama 3.3 70B — Tier 1 6/6, Tier 2 10/10 but zero real assertions; SUMMARY:
+  "not for unattended posting… accuracy slips on tasks needing care" (newsletter
+  attribution error, mangled URL, missed a conflict alert).
+- Qwen3.5-122B-A10B — best calendar/conflict handling but broke character ("I am
+  an AI text model and cannot access your local file system"), verbose, ~65 GB
+  resident, ~66 s latency, older generation than the 3.6 currently running.
+- The eval tasks are ALL single-turn. None simulate driving a stateful multi-phase
+  process — which is the actual failure with Beast/Jensen. Re-running the current
+  eval cannot answer the real question. No local model in this class reliably
+  drives the 6-phase pipeline unattended today.
+Conclusion delivered: the auto-advance mechanism is the higher-leverage fix — it
+turns "model stalled" from a dead run into a self-healing one and makes any of
+these models workable. (A dedicated multi-step process-driving eval task is worth
+building later, but it's diagnostic, not a fix.)
+
+Auto-advance design: written to `plans/AUTO-ADVANCE-DESIGN.md` (design only, NOT
+built — plan-then-build). `pipeline.py --watch <edit-dir>`: a detached loop spawned
+by `init`, one per edit-dir (`jobs/watch.lock`), self-terminating on DONE / a
+wall-clock cap / missing state. It owns every mechanical transition (INGEST +
+RENDER auto-advance by running `pipeline.py <dir>` itself; a failed job is retried
+exactly once then escalated to a human — kills the retry-storm class) and fires a
+rate-limited `openclaw system event --mode now` nudge ONLY for the agent-owed
+artifacts (STRATEGY `strategy.md`, EDL `edl.json`), with the exact instruction +
+error text. It never writes an artifact, never runs `--confirm-strategy` (human
+approval) or `--eval-verdict pass` (human/Claude-Code review — the fabricated-review
+guard stands). Load-bearing open question flagged in the doc: does `system event
+--mode now` reliably trigger an agent turn? A manually-confirmed one did NOT
+visibly wake Beast within 15 min on 2026-09-08 — a transport spike (system event
+vs Discord send vs `--expect-final`) is the first build step. Awaiting Mike's review.
+
+## Auto-advance watcher — BUILT (2026-09-08 evening, "build it")
+
+Shipped `pipeline.py <edit-dir> --watch` + `_job_lock.send_system_event`.
+
+- `pipeline.py init` auto-spawns a detached `--watch` loop ONLY when
+  `--notify-session` is set (an agent run); Claude Code `init` never spawns one;
+  `--no-watch` suppresses it. Lock `jobs/watch.lock` (pid, single instance),
+  state `jobs/watch_state.json`, log `jobs/watch.log`.
+- The loop reads `pipeline_state.json` every 20s and: runs `pipeline.py <dir>`
+  itself to advance INGEST and RENDER; at STRATEGY/EDL sends ONE rate-limited
+  `system event --mode now` nudge naming the artifact owed (EDL nudges carry the
+  exact validator rejection text, keyed to edl.json's mtime so each fresh edit
+  gets one fresh nudge); at SELF_EVAL generates the eval frames, fires one
+  "needs a sighted review" nudge, then exits (an agent-started run cannot pass
+  that phase — the fabricated-review guard stands).
+- Caps (each stops the watcher and pings the session for a human):
+  `MAX_CONSEC_FAIL=2` — one job failure + one retry then stop (this is the
+  whisper/ffmpeg retry-storm breaker Mike had to kill by hand on Jensen);
+  `MAX_NUDGES_PER_PHASE=6` — then stop on the write phases / go quiet on the
+  human-gated confirm; `WATCH_MAX_S=5400` wall clock; `MAX_DRIVER_RUNS_PER_PHASE
+  =60` no-progress backstop. `STATE_SETTLE_S=12` skips a cycle if the agent just
+  wrote state (collision avoidance with a live agent turn).
+- Never writes strategy.md / edl.json / eval_review.md; never runs
+  `--confirm-strategy` or `--eval-verdict pass`.
+- exec-approvals: `pipeline.py` is allowlisted with no argPattern for both
+  agents, so `--watch` needs no change; the auto-spawn and the `openclaw system
+  event` call are plain subprocesses, not exec-gated.
+- SKILL.md (canonical + both scoped, scoped byte-identical to each other) and
+  both SOUL.md copies now carry: "a watcher advances the mechanical steps and
+  will nudge you; when nudged, do exactly that one action, then stop."
+- Tests (in-tree, temp dirs, 2026-09-08): nudge cooldown + budget→stop;
+  consec-fail cap stops on the 2nd failure with an escalation; real 3s clip
+  `init → watcher → INGEST (polls, "WAITING" not misread) → STRATEGY`;
+  EDL-reject path emits one mtime-keyed nudge with the error text; refuses to
+  start on DONE / missing state / a live existing lock.
+
+STILL OPEN (load-bearing, needs a live agent run): whether `system event
+--mode now` reliably produces an agent TURN. A manual one didn't visibly wake
+Beast on 2026-09-08. Every nudge logs `sent=True/False`; the first real Jensen/
+Beast run under the watcher answers it. If `sent=True` doesn't wake the agent,
+swap the nudge transport (Discord channel post / `--expect-final`) — isolated to
+`_job_lock.send_system_event` + `pipeline._nudge`.

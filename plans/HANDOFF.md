@@ -1,6 +1,8 @@
 # Handoff — video-use `pipeline.py` driver: built, Beast run complete, Jensen parked
 
-_Last updated: 2026-09-08T18:10:00-05:00_
+_Last updated: 2026-09-08T22:40:00-05:00 (reconstructed after auto-compaction — some
+fine detail from the model-eval discussion may be lost; the authoritative record of
+every fix is `plans/OBJECTIVE.md`)._
 
 ## 1. Goal
 
@@ -25,6 +27,7 @@ Claude), and a dense chronological work log of everything done today.
 - `helpers/pipeline.py` — the driver. State machine
   `INGEST → STRATEGY → EDL → RENDER → SELF_EVAL → DONE`, state in
   `<edit>/pipeline_state.json`. Features added across today:
+  - `--watch`: detached auto-advance loop (see §4a); `init` auto-spawns it for agent runs
   - forces `--edit-dir` to `<first-source-parent>/edit` (agents kept inventing paths)
   - re-execs under `<repo>/.venv/bin/python3` if launched otherwise (Jensen's exec
     ignored the shebang → system python 3.9, no numpy/PIL)
@@ -44,6 +47,9 @@ Claude), and a dense chronological work log of everything done today.
   `~/.openclaw[-<profile>]/service-env/*.env`, passes `--token`, prints
   `[notify] …` to the job log (was a silent `except: pass`); a `--notify-profile`
   with no real install (`service-env/` absent) falls back to the default profile.
+  2026-09-08: wake logic factored into `send_system_event()` (returns bool),
+  shared with the `pipeline.py --watch` nudger; `notify_completion` is now a thin
+  wrapper.
 - `helpers/filler_cuts.py` — NEW. `expand_edl()` splits each coarse range around
   every filler word (`check_fillers.py` FILLER_WORDS + verbatim timestamps, ±40 ms,
   drop <80 ms sub-ranges, ignore <50 ms artifacts).
@@ -116,8 +122,67 @@ stable; it will relaunch transcription off the failed lock. (The AVIF *is* in
 - **Hand-editing an EDL / restaging state to force a run through** — Mike's explicit
   rule: if you or he has to edit something, the process is broken. Fix the class.
 
+## 4a. Since the last handoff (2026-09-08 evening)
+
+- **Model research for multi-step driving** — Mike asked to test Llama 3.3 70B and
+  Qwen3.5-122B-A10B on the evals. Finding: **both were already run 2026-08-31**
+  (`~/github/openclaw-config/model-eval/runs/results2_{llama33,qwen122}.json`,
+  `results/tier1-2026-08-31/SUMMARY.md`). Llama 3.3 70B — "not for unattended
+  posting, accuracy slips on tasks needing care" (attribution error, mangled URL,
+  missed conflict alert). Qwen3.5-122B-A10B — best calendar/conflict handling but
+  broke character ("I am an AI text model…"), verbose, ~65 GB resident, ~66 s
+  latency, older generation. **The eval is 100% single-turn — it does not measure
+  driving a stateful multi-phase process, which is the actual failure mode.**
+  Conclusion given to Mike: re-running the current eval answers nothing; no local
+  model in this class reliably drives a 6-phase pipeline unattended today; the
+  **auto-advance mechanism is the higher-leverage fix** and is what he asked for
+  next.
+- **Auto-advance watcher — BUILT** (Mike: "build it"). `plans/AUTO-ADVANCE-DESIGN.md`
+  marked BUILT with build notes + test log.
+  - `pipeline.py <edit-dir> --watch [--watch-max-seconds N]` — detached loop.
+    `pipeline.py init` auto-spawns it **only when `--notify-session` is set** (an
+    agent run); Claude Code never gets one; `--no-watch` suppresses. Files under
+    `<edit>/jobs/`: `watch.lock` (pid, single-instance), `watch_state.json`,
+    `watch.log`.
+  - Every 20s reads `pipeline_state.json`: runs `pipeline.py <dir>` itself to
+    advance INGEST + RENDER; at STRATEGY / EDL sends ONE rate-limited
+    `system event --mode now` nudge naming the owed artifact (EDL nudge carries
+    the exact validator rejection, keyed to `edl.json` mtime → one fresh nudge
+    per fresh edit); at SELF_EVAL generates the eval frames, fires one
+    "needs a sighted review" nudge, then exits (agent-started runs can't pass
+    that phase).
+  - Caps, each → stop watcher + ping the session for a human:
+    `MAX_CONSEC_FAIL=2` (one job failure + one retry — the whisper/ffmpeg
+    retry-storm breaker), `MAX_NUDGES_PER_PHASE=6`, `WATCH_MAX_S=5400`,
+    `MAX_DRIVER_RUNS_PER_PHASE=60`. `STATE_SETTLE_S=12` skips a cycle if the
+    agent just wrote state. Never authors an artifact; never runs
+    `--confirm-strategy` / `--eval-verdict pass`.
+  - `_job_lock.send_system_event()` factored out (shared by `notify_completion`
+    + the watcher). exec-approvals unchanged (`pipeline.py` has no argPattern;
+    the spawn + `openclaw` call are plain subprocesses).
+  - SKILL.md canonical + both scoped (scoped byte-identical to each other) and
+    both SOUL.md copies: "when a nudge names a next action, do exactly that one
+    thing, then stop."
+  - Tested in-tree (temp dirs): nudge cooldown + budget→stop; consec-fail stops
+    on the 2nd failure with an escalation; real 3 s clip
+    `init → watcher → INGEST (polls, "WAITING" not misread) → STRATEGY`;
+    EDL-reject emits one mtime-keyed nudge with the error; start-refusal on
+    DONE / missing-state / live-lock. Compiles; unit checks pass.
+  - **STILL OPEN — needs a live agent run:** does `system event --mode now`
+    reliably produce an agent TURN? A manual one didn't visibly wake Beast on
+    2026-09-08. Every nudge logs `sent=True/False` to `watch.log`; the first real
+    Jensen/Beast run answers it. If it sends but doesn't wake — swap the
+    transport (Discord channel post / `--expect-final`), isolated to
+    `_job_lock.send_system_event` + `pipeline._nudge`.
+
 ## 5. What to do next
 
+0. **Live-test the watcher on a real agent run.** Start a Jensen/Beast edit (it
+   auto-spawns the watcher). Tail `<edit>/jobs/watch.log` and confirm: (a) INGEST
+   and RENDER self-advance; (b) a STRATEGY/EDL nudge logs `sent=True` **and**
+   actually triggers an agent turn; (c) a deliberately-broken `edl.json` draws
+   the reject nudge and a fixed one advances. If nudges send but don't wake the
+   agent, swap the transport per AUTO-ADVANCE-DESIGN.md's build checklist.
 1. **Close the objective (needs Mike).** Walk `plans/OBJECTIVE.md` criterion by
    criterion. The 3 OPEN directives in the log ("use a script", "the more robust
    fix", "make it work beginning to end") are satisfied — the driver exists and ran
