@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -39,6 +41,14 @@ import _job_lock  # noqa: E402
 WHISPER_BIN = "whisper"
 DEFAULT_MODEL = "turbo"
 DEFAULT_DEVICE = "cpu"  # MPS is broken for word-level timestamps in this openai-whisper
+
+# On the 16-vCPU VM, an unthrottled whisper (turbo + word_timestamps) spins up a
+# worker per core and drives load to ~13 on its own -- a transient memory spike
+# near the alignment step then gets a worker SIGKILL'd (jetsam is flaky in the
+# VM), and the whole job dies at ~98% with a "leaked semaphore" trace. Capping
+# the thread pools keeps the load and the memory footprint in a range the box
+# survives, at ~1.5x wall time. Override with VIDEO_USE_WHISPER_THREADS.
+WHISPER_THREADS = os.environ.get("VIDEO_USE_WHISPER_THREADS", "8")
                         # version: the DTW alignment step casts to float64, which Apple's
                         # Metal backend doesn't support at all. Confirmed by direct test
                         # (2026-07-27) — not a flag fix, CPU is the only working option.
@@ -93,9 +103,35 @@ def call_whisper(
     if verbatim:
         cmd += ["--initial_prompt", VERBATIM_PROMPT, "--carry_initial_prompt", "True"]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"whisper failed: {result.stderr[-2000:]}")
+    env = {
+        **os.environ,
+        "OMP_NUM_THREADS": WHISPER_THREADS,
+        "MKL_NUM_THREADS": WHISPER_THREADS,
+        "OPENBLAS_NUM_THREADS": WHISPER_THREADS,
+        "NUMEXPR_NUM_THREADS": WHISPER_THREADS,
+        "VECLIB_MAXIMUM_THREADS": WHISPER_THREADS,
+        "PYTORCH_NUM_THREADS": WHISPER_THREADS,
+    }
+    # start_new_session so the whole whisper process group can be killed as one --
+    # otherwise, if this transcribe.py is killed (retry storm, gateway restart),
+    # whisper's torch worker keeps running detached and pins ~12 cores (seen
+    # 2026-09-09: an orphan at 1233% CPU for minutes after its parent died).
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=env, start_new_session=True)
+    try:
+        _out, err = proc.communicate()
+    except BaseException:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            proc.kill()
+        raise
+    if proc.returncode != 0:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)  # reap any stragglers
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        raise RuntimeError(f"whisper failed: {(err or '')[-2000:]}")
 
     raw_path = out_dir / f"{audio_path.stem}.json"
     payload = json.loads(raw_path.read_text())

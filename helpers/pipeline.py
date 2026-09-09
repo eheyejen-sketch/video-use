@@ -58,6 +58,7 @@ transcription failed).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -1136,6 +1137,28 @@ def _watch_paths(edit_dir: Path):
     return jobs / "watch.lock", jobs / "watch_state.json", jobs / "watch.log"
 
 
+# ── run coordination (survives `rm -rf <edit-dir>`) ──────────────────
+# 2026-09-09: after a transcription failed, an agent re-ran `pipeline.py init`
+# in a loop -- each iteration rm'd the edit dir (taking jobs/watch.lock with it),
+# so `_spawn_watcher` saw no lock and started a fresh watcher + whisper on top of
+# the previous ones. Load hit 13 x N. These markers live OUTSIDE the edit dir so
+# a delete can't clear them, and let init + the watcher detect "already running".
+
+def _coord_path(edit_dir: Path, suffix: str) -> Path:
+    d = Path.home() / ".cache" / "video-use" / "locks"
+    d.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha1(str(Path(edit_dir).resolve()).encode()).hexdigest()[:16]
+    return d / f"{key}.{suffix}"
+
+
+def _live_watcher_pid(edit_dir: Path) -> int | None:
+    try:
+        pid = int(_coord_path(edit_dir, "watch").read_text().strip())
+    except (ValueError, OSError):
+        return None
+    return pid if (pid and _pid_alive(pid) and pid != os.getpid()) else None
+
+
 def _read_json(p: Path):
     try:
         return json.loads(p.read_text())
@@ -1220,12 +1243,18 @@ def do_watch(edit_dir: Path, max_seconds: int) -> None:
     if other and other.get("pid") and _pid_alive(other["pid"]) and other["pid"] != os.getpid():
         print(f"watcher already running for {edit_dir} (pid {other['pid']}); exiting.")
         return
+    existing = _live_watcher_pid(edit_dir)  # survives `rm -rf <edit-dir>`
+    if existing:
+        print(f"watcher already running for {edit_dir} (pid {existing}, coord marker); exiting.")
+        return
 
     st0 = _read_json(state_path(edit_dir)) or {}
     if st0.get("phase") == "DONE":
         print(f"pipeline for {edit_dir} is already DONE; not starting a watcher.")
         return
 
+    coord = _coord_path(edit_dir, "watch")
+    coord.write_text(str(os.getpid()))
     lock_file.write_text(json.dumps({"pid": os.getpid(), "started_at": time.time()}))
     wstate = _read_json(wstate_file) or {}
     wstate.setdefault("started_at", time.time())
@@ -1238,12 +1267,20 @@ def do_watch(edit_dir: Path, max_seconds: int) -> None:
     def persist() -> None:
         wstate_file.write_text(json.dumps(wstate, indent=2))
 
+    def _release_coord() -> None:
+        try:
+            if coord.read_text().strip() == str(os.getpid()):
+                coord.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     def stop(reason: str, ping: bool = True) -> None:
         wstate["stopped"] = True
         wstate["stopped_reason"] = reason
         wstate["stopped_at"] = time.time()
         persist()
         lock_file.unlink(missing_ok=True)
+        _release_coord()
         _wlog(f"STOP: {reason}")
         if ping:
             st = _read_json(state_path(edit_dir)) or {}
@@ -1266,6 +1303,15 @@ def do_watch(edit_dir: Path, max_seconds: int) -> None:
             stop(f"wall-clock cap ({max_seconds}s) reached without finishing")
             return
 
+        try:
+            owner = _coord_path(edit_dir, "watch").read_text().strip()
+        except OSError:
+            owner = str(os.getpid())
+        if owner != str(os.getpid()) and _pid_alive(int(owner or 0) if owner.isdigit() else 0):
+            _wlog(f"a newer watcher (pid {owner}) owns this edit dir — exiting")
+            lock_file.unlink(missing_ok=True)
+            return
+
         st = _read_json(state_path(edit_dir))
         if st is None:
             stop(f"{STATE_NAME} disappeared (edit dir deleted?)", ping=False)
@@ -1280,6 +1326,7 @@ def do_watch(edit_dir: Path, max_seconds: int) -> None:
             wstate["stopped_reason"] = "pipeline DONE"
             persist()
             lock_file.unlink(missing_ok=True)
+            _release_coord()
             return
 
         if wstate["driver_runs"].get(phase, 0) > MAX_DRIVER_RUNS_PER_PHASE:
@@ -1324,9 +1371,10 @@ def do_watch(edit_dir: Path, max_seconds: int) -> None:
             return
         if result == "exit":
             wstate["stopped"] = True
-            wstate["stopped_reason"] = "handed off at SELF_EVAL"
+            wstate["stopped_reason"] = "handed off"
             persist()
             lock_file.unlink(missing_ok=True)
+            _release_coord()
             return
         nap()
 
@@ -1414,6 +1462,11 @@ def _watch_edl(edit_dir: Path, st: dict, wstate: dict, skey, prof):
 
 
 def _spawn_watcher(edit_dir: Path) -> None:
+    existing = _live_watcher_pid(edit_dir)
+    if existing:
+        print(f"note: a watcher (pid {existing}) is already running for this edit "
+              f"dir — not starting another.")
+        return
     _, _, log = _watch_paths(edit_dir)
     try:
         with open(log, "a") as lf:
@@ -1461,13 +1514,35 @@ def do_init(argv: list[str]) -> None:
         print(f"note: ignoring --edit-dir {args.edit_dir} — the edit folder always "
               f"lives beside the source video. Using {canonical}.")
     edit_dir = canonical
-    edit_dir.mkdir(parents=True, exist_ok=True)
 
+    # Guard against an init loop: a previous run's watcher is still alive (the
+    # coord marker survives `rm -rf <edit-dir>`). 2026-09-09: an agent re-ran
+    # `init` every ~60s after transcription failed, stacking watchers + whisper
+    # jobs until load hit 13xN. If a step FAILED, the fix is `pipeline.py
+    # <edit-dir>` (resume), never `init` (start over).
+    lw = _live_watcher_pid(edit_dir)
+    if lw:
+        sys.exit(f"REFUSED: a watcher (pid {lw}) is already running for this edit. "
+                 f"Do NOT re-init. If a step failed, run `pipeline.py {edit_dir}` "
+                 f"(or `--status`) to resume. To truly start over, stop that watcher "
+                 f"first (`kill {lw}`) and delete {edit_dir}.")
+    im = _coord_path(edit_dir, "init")
+    try:
+        age = time.time() - float(im.read_text().strip())
+    except (ValueError, OSError):
+        age = 1e9
+    if age < 150:
+        sys.exit(f"REFUSED: `pipeline.py init` for this video ran {int(age)}s ago. "
+                 f"If a step failed, run `pipeline.py {edit_dir}` to resume — do not "
+                 f"re-init. (Wait {int(150 - age)}s to force a fresh start.)")
+
+    edit_dir.mkdir(parents=True, exist_ok=True)
     existing = state_path(edit_dir)
     if existing.exists():
         old = json.loads(existing.read_text())
         sys.exit(f"REFUSED: {existing} already exists (phase {old.get('phase')}). "
                  f"Delete {edit_dir} to start over, or just run `pipeline.py {edit_dir}`.")
+    im.write_text(str(time.time()))
 
     state = {
         "version": 1,
