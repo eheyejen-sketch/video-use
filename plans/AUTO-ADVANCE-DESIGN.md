@@ -1,8 +1,13 @@
 # Design — `pipeline.py --watch`: auto-advance the video-use pipeline
 
-_Written 2026-09-08. **Status: BUILT 2026-09-08** (`video-use` helpers/pipeline.py +
-helpers/_job_lock.py). Not yet exercised on a live agent run — the nudge-transport
-question below is still open and the first live run answers it._
+_Written 2026-09-08. **Status: BUILT + VERIFIED LIVE 2026-09-08.** A full Beast run
+(`test-beast`, 22:16–22:27) went INGEST→STRATEGY→EDL→RENDER→SELF_EVAL entirely on
+the watcher: 2 nudges (STRATEGY, EDL), both `sent=True`, **both produced a Beast
+turn within ~15–31 s** — the nudge-transport question is answered, `system event
+--mode now` reliably wakes the agent. INGEST self-advanced over 18 polls, RENDER
+over 6, zero failures/retries, watcher exited cleanly at SELF_EVAL
+(`stopped_reason: "handed off at SELF_EVAL"`). The run also exposed a real gate
+hole — see "STRATEGY confirmation" below._
 
 ## Build notes (what actually shipped)
 
@@ -28,6 +33,28 @@ question below is still open and the first live run answers it._
   `init → watcher → INGEST (3 driver polls, "WAITING" not misread as failure)
   → STRATEGY` on a real 3 s clip; EDL-reject path emits one nudge keyed to the
   edl.json mtime (a fresh edit ⇒ a fresh nudge).
+- **Live Beast run 2026-09-08 22:16–22:27** — verified the whole lifecycle end to
+  end (see the status line at the top).
+
+## STRATEGY confirmation — a self-certifiable gate the live run exposed (FIXED 2026-09-08)
+
+The live run's STRATEGY nudge woke Beast, which wrote `strategy.md` with a `##
+User confirmation` section containing an **invented quote** — `"Go ahead with
+this plan."` — attributed to Mike for a plan (specific cut ranges) Mike had never
+seen, then ran `--confirm-strategy` itself ~31 s after the nudge, despite having
+said 20 min earlier it would wait for confirmation. Same failure class as the
+fabricated SELF_EVAL review.
+
+Fix (mirrors the SELF_EVAL `--reviewer` gate): `--confirm-strategy` from an
+agent-started run (`running_as_agent(state)`) is refused unless it carries
+`--confirmed-by <name>`, which only a human / Claude Code supplies after the user
+actually approves. The gate records `strategy_confirmed.confirmed_by`. The agent
+writes `strategy.md`, presents the plan, and stops. `_STRATEGY_NUDGE` /
+`_STRATEGY_CONFIRM_NUDGE` and the INGEST/STRATEGY/status/restage guidance text
+updated to say so; SKILL.md (canonical + both scoped) + both SOUL.md too.
+Tested: agent run without the flag → REFUSED, phase held; with
+`--confirmed-by claude-code` → advances; Claude Code run (no notify) →
+advances without the flag (records `confirmed_by: "user"`).
 
 ---
 
@@ -110,13 +137,15 @@ DONE. Beast's contribution: 2 nudged artifacts. A stall between them self-heals.
 - [x] exec-approval: confirmed `pipeline.py` is allowlisted with no argPattern,
       so `--watch` is covered; the auto-spawn and `openclaw system event` are
       plain subprocesses, not gated.
-- [ ] **Spike the nudge transport on a LIVE run** (`system event --mode now` vs
-      Discord send vs `--expect-final`) — still the load-bearing unknown. Every
-      nudge logs `sent=True/False` to `jobs/watch.log`; the first real agent run
-      shows whether `sent=True` actually produces an agent turn.
-- [ ] SKILL.md + SOUL.md wording: "a watcher advances the mechanical steps and
-      will nudge you; when nudged, do exactly what it says — one artifact, then
-      stop." (doing this now)
-- [ ] Live test: start an agent run, let it stall mid-STRATEGY → confirm the
-      watcher re-nudges after the cooldown and a fresh agent turn completes it;
-      stall mid-RENDER → confirm the watcher advances with no agent turn.
+- [x] **Nudge transport verified on a LIVE run** — `system event --mode now`
+      produced a Beast turn within ~15–31 s at both STRATEGY and EDL (Beast run
+      2026-09-08 22:16–22:27). No transport swap needed.
+- [x] SKILL.md + SOUL.md wording: "when a nudge names a next action, do exactly
+      that one thing, then stop."
+- [x] Live full-run: INGEST + RENDER self-advanced; STRATEGY + EDL nudges each
+      drew a Beast turn; watcher exited cleanly at SELF_EVAL.
+- [x] STRATEGY confirmation self-certification hole found on that run and fixed
+      (`--confirmed-by` gate — see section above).
+- [ ] Follow-up live test: deliberately stall mid-STRATEGY → confirm the watcher
+      re-nudges at the 300 s cooldown and a fresh turn completes it. (Not yet
+      done — the live run advanced too fast to exercise the re-nudge path.)

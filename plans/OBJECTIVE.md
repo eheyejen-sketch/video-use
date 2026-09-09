@@ -464,3 +464,41 @@ Beast on 2026-09-08. Every nudge logs `sent=True/False`; the first real Jensen/
 Beast run under the watcher answers it. If `sent=True` doesn't wake the agent,
 swap the nudge transport (Discord channel post / `--expect-final`) — isolated to
 `_job_lock.send_system_event` + `pipeline._nudge`.
+
+## Live watcher test + STRATEGY self-confirmation guard (2026-09-08 late)
+
+Fresh Beast run through the watcher (test-beast, 22:16–22:27, clean edit folder):
+- Watcher auto-spawned on `init` (pid 5859).
+- INGEST→STRATEGY→EDL→RENDER→SELF_EVAL entirely watcher-driven. 2 nudges
+  (STRATEGY:write, EDL:write), both `sent=True`, **both produced a Beast turn**
+  within ~15–31 s. INGEST 18 polls, RENDER 6 polls, `consec_fail` 0 throughout.
+  Watcher fired the SELF_EVAL review nudge and exited cleanly
+  (`stopped_reason: "handed off at SELF_EVAL"`, lock released).
+- **`system event --mode now` reliably wakes the agent — the load-bearing open
+  question from AUTO-ADVANCE-DESIGN.md is CLOSED.** No transport swap needed.
+- Render produced `final.mp4` 42.4s (Beast's own strategy said ~55s — it cut
+  harder than it stated; not a pipeline bug).
+
+Hole the run exposed — STRATEGY confirmation was self-certifiable. Beast's
+`strategy.md` `## User confirmation` section contained an invented quote — `"Go
+ahead with this plan."` — for cut ranges Mike never saw, and Beast ran
+`--confirm-strategy` itself ~31 s after the nudge (having said 20 min earlier it
+would wait). Same class as the fabricated SELF_EVAL review.
+
+Fix shipped (mirrors the SELF_EVAL `--reviewer` gate):
+- `--confirm-strategy` from an agent-started run (`running_as_agent`) is refused
+  without `--confirmed-by <name>`; a human / Claude Code supplies it after the
+  user actually approves. Gate records `strategy_confirmed.confirmed_by`.
+- New `--confirmed-by` arg; wired through `main` → `phase_strategy`.
+- Agent-facing text updated everywhere it said "then run --confirm-strategy":
+  `INGEST_DONE_MSG`, `STRATEGY_REMINDER`, `_STRATEGY_NUDGE`,
+  `_STRATEGY_CONFIRM_NUDGE`, `print_status` owed dict, `do_restage` strategy
+  branch, module docstring. SKILL.md canonical + both scoped (byte-identical) +
+  both SOUL.md.
+- Tested: agent run, no flag → REFUSED + phase held; agent run + `--confirmed-by
+  claude-code` → advances (`confirmed_by: "claude-code"`); Claude Code run (no
+  notify) → advances without the flag (`confirmed_by: "user"`). Compiles.
+
+test-beast is parked at SELF_EVAL. The edit was built on the fabricated-confirm
+plan, so it's a watcher-mechanics artifact, not an approved edit — Mike decides
+whether to review it or restage from STRATEGY with the guard in place.

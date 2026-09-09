@@ -33,7 +33,8 @@ CLI
                  [--notify-session KEY] [--notify-profile PROFILE] [--no-watch]
     pipeline.py <edit-dir>                     # run/advance the current phase
     pipeline.py <edit-dir> --status            # report only, never mutates
-    pipeline.py <edit-dir> --confirm-strategy  # STRATEGY gate
+    pipeline.py <edit-dir> --confirm-strategy [--confirmed-by NAME]  # STRATEGY gate
+                 #   --confirmed-by required when an agent started the run
     pipeline.py <edit-dir> --eval-verdict pass|fail [--restage edl|render]
     pipeline.py <edit-dir> --restage strategy|edl|render|self_eval  # manual step-back
     pipeline.py <edit-dir> --watch            # detached auto-advance loop
@@ -341,9 +342,16 @@ content type, target length/aspect, aesthetic, pacing, must-keep and
 must-cut moments. Then write your proposed strategy (4–8 sentences: shape,
 cut direction, length target, grade, subtitle style) to `{edit}/strategy.md`,
 INCLUDING a `## User confirmation` section that quotes the user approving the
-plan in plain English. Then run:
+plan in plain English.
+
+Then it is confirmed with:
 
     pipeline.py {edit} --confirm-strategy
+
+**If an agent started this run, you cannot confirm your own strategy** — write
+strategy.md, present the plan to the user, and STOP. After the user actually
+approves, a human or Claude Code runs the command above with
+`--confirmed-by <name>`.
 """
 
 
@@ -431,13 +439,16 @@ Phase STRATEGY. The briefing is ready at `{edit}/briefing.md`.
 
 YOU OWE: `{edit}/strategy.md` — 4–8 sentences (shape, cut direction, length
 target, grade, subtitle style) plus a `## User confirmation` section quoting
-the user's plain-English approval. Then run:
+the user's plain-English approval.
 
-    pipeline.py {edit} --confirm-strategy
+Confirmed with `pipeline.py {edit} --confirm-strategy`. **An agent cannot
+confirm its own strategy** — write strategy.md, present the plan, and stop;
+a human or Claude Code runs the confirm with `--confirmed-by <name>` once the
+user has approved.
 """
 
 
-def phase_strategy(state: dict, confirm: bool) -> None:
+def phase_strategy(state: dict, confirm: bool, confirmed_by: str | None = None) -> None:
     edit_dir = Path(state["edit_dir"])
     if not confirm:
         print(STRATEGY_REMINDER.format(edit=edit_dir))
@@ -459,8 +470,28 @@ def phase_strategy(state: dict, confirm: bool) -> None:
               f"proceed to cutting without recorded confirmation (SKILL.md Hard Rule 11).")
         sys.exit(1)
 
+    # An agent-started run CANNOT confirm its own strategy. The `## User
+    # confirmation` section is prose the agent itself wrote; the pipeline can't
+    # tell a real quote from an invented one, and an agent HAS fabricated one --
+    # 2026-09-08 Beast wrote `"Go ahead with this plan."` and self-ran
+    # --confirm-strategy ~31s after being nudged, for a plan with specific cut
+    # ranges the user had never seen. So confirmation from an agent-started run
+    # requires --confirmed-by <name>, which asserts a human / Claude Code
+    # actually relayed the user's approval (mirrors the SELF_EVAL --reviewer
+    # gate). The agent's job is to write strategy.md, present the plan, and stop.
+    if running_as_agent(state) and not confirmed_by:
+        print("REFUSED: this run was started by an agent, which cannot confirm its "
+              "own strategy — the `## User confirmation` section is text the agent "
+              "wrote and the pipeline cannot verify the quote is real (an agent has "
+              "fabricated a user approval here before).\n"
+              "Write strategy.md, present the plan to the user, and STOP. Once the "
+              "user has actually approved it, a human or Claude Code runs:\n"
+              f"    pipeline.py {edit_dir} --confirm-strategy --confirmed-by <name>\n"
+              "from a non-agent context.")
+        sys.exit(1)
+
     state["phase"] = "EDL"
-    state["gates"]["strategy_confirmed"]["done"] = True
+    state["gates"]["strategy_confirmed"] = {"done": True, "confirmed_by": confirmed_by or "user"}
     save_state(state)
     print(f"Strategy confirmed. Phase EDL.\n\n"
           f"YOU OWE: `{edit_dir}/edl.json` per SKILL.md 'EDL format'. Every range needs "
@@ -887,12 +918,15 @@ def do_restage(state: dict, target: str) -> None:
         sys.exit(0)
     if target == "strategy":
         state["phase"] = "STRATEGY"
-        for g in ("strategy_confirmed", "edl_validated", "render_done"):
+        state["gates"]["strategy_confirmed"] = {"done": False}
+        for g in ("edl_validated", "render_done"):
             state["gates"][g]["done"] = False
         save_state(state)
         print(f"Restaged to STRATEGY. Rewrite {state['edit_dir']}/strategy.md "
-              f"(with a real `## User confirmation`), then "
-              f"`pipeline.py {state['edit_dir']} --confirm-strategy`.")
+              f"(with a real `## User confirmation`). It is then confirmed with "
+              f"`pipeline.py {state['edit_dir']} --confirm-strategy` — an agent "
+              f"cannot confirm its own strategy; a human runs it with "
+              f"`--confirmed-by <name>`.")
         sys.exit(0)
     if target == "edl":
         state["phase"] = "EDL"
@@ -928,8 +962,10 @@ def print_status(state: dict) -> None:
     owed = {
         "INGEST": "run `pipeline.py <edit-dir>` (it does ffprobe/transcribe/pack/"
                   "fillers/gaps, then hands you briefing.md).",
-        "STRATEGY": "write strategy.md (+ `## User confirmation`), then "
-                    "`pipeline.py <edit-dir> --confirm-strategy`.",
+        "STRATEGY": "write strategy.md (+ `## User confirmation`); a human/Claude "
+                    "Code then runs `pipeline.py <edit-dir> --confirm-strategy` "
+                    "(`--confirmed-by <name>` if an agent started this run — the "
+                    "agent cannot confirm its own strategy).",
         "EDL": "write edl.json per SKILL.md, then `pipeline.py <edit-dir>`.",
         "RENDER": "run `pipeline.py <edit-dir>` to render (nothing to author).",
         "SELF_EVAL": "run `pipeline.py <edit-dir>` for eval frames, inspect them, "
@@ -1032,14 +1068,15 @@ _STRATEGY_NUDGE = (
     "{edit}/briefing.md in full, discuss the edit with the user, then write "
     "{edit}/strategy.md (4-8 sentences: shape, cut direction, length target, "
     "grade, subtitle style) with a `## User confirmation` section quoting the "
-    "user's plain-English approval. Then run:  pipeline.py {edit} --confirm-strategy"
-    "  — do only that, then stop."
+    "user's plain-English approval. Then PRESENT the plan to the user and STOP — "
+    "you cannot confirm your own strategy; a human runs --confirm-strategy once "
+    "the user has actually approved."
 )
 _STRATEGY_CONFIRM_NUDGE = (
-    "video-use pipeline for {edit}: strategy.md is written and needs the user's "
-    "approval recorded in a `## User confirmation` section, then:  "
-    "pipeline.py {edit} --confirm-strategy  . The watcher will not run that step "
-    "for you — it is human-gated."
+    "video-use pipeline for {edit}: strategy.md is written. It now needs the "
+    "user's real approval, then a human or Claude Code runs:  "
+    "pipeline.py {edit} --confirm-strategy --confirmed-by <name>  . The agent "
+    "cannot run this step and the watcher will not run it — it is human-gated."
 )
 _EDL_NUDGE = (
     "video-use pipeline for {edit} is at EDL and waiting on you. Write "
@@ -1374,6 +1411,10 @@ def main() -> None:
     ap.add_argument("edit_dir", type=Path)
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--confirm-strategy", action="store_true")
+    ap.add_argument("--confirmed-by", type=str, default=None,
+                    help="who relayed the user's approval of the strategy (required to "
+                         "`--confirm-strategy` an agent-started run; the agent cannot "
+                         "confirm its own plan and must hand off)")
     ap.add_argument("--eval-verdict", choices=["pass", "fail"], default=None)
     ap.add_argument("--reviewer", type=str, default=None,
                     help="who inspected the eval frames (required to `--eval-verdict "
@@ -1403,7 +1444,7 @@ def main() -> None:
         if state["phase"] != "STRATEGY":
             sys.exit(f"REFUSED: --confirm-strategy only valid in STRATEGY phase "
                      f"(currently {state['phase']}).")
-        phase_strategy(state, confirm=True)
+        phase_strategy(state, confirm=True, confirmed_by=args.confirmed_by)
         return
     if args.eval_verdict:
         if state["phase"] != "SELF_EVAL":

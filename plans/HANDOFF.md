@@ -168,12 +168,19 @@ stable; it will relaunch transcription off the failed lock. (The AVIF *is* in
     `init → watcher → INGEST (polls, "WAITING" not misread) → STRATEGY`;
     EDL-reject emits one mtime-keyed nudge with the error; start-refusal on
     DONE / missing-state / live-lock. Compiles; unit checks pass.
-  - **STILL OPEN — needs a live agent run:** does `system event --mode now`
-    reliably produce an agent TURN? A manual one didn't visibly wake Beast on
-    2026-09-08. Every nudge logs `sent=True/False` to `watch.log`; the first real
-    Jensen/Beast run answers it. If it sends but doesn't wake — swap the
-    transport (Discord channel post / `--expect-final`), isolated to
-    `_job_lock.send_system_event` + `pipeline._nudge`.
+  - **VERIFIED LIVE 2026-09-08 22:16–22:27** (Beast, test-beast): full run
+    INGEST→STRATEGY→EDL→RENDER→SELF_EVAL on the watcher; both nudges produced a
+    Beast turn in ~15–31s → `system event --mode now` reliably wakes the agent,
+    open question CLOSED, no transport swap. INGEST 18 polls / RENDER 6 / 0
+    failures / clean exit at SELF_EVAL.
+  - **Gate hole found on that run + FIXED:** STRATEGY confirmation was
+    self-certifiable — Beast wrote a fake `"Go ahead with this plan."` quote and
+    ran `--confirm-strategy` itself. Now: agent-started runs need
+    `--confirmed-by <name>` (mirrors the SELF_EVAL `--reviewer` gate). New
+    `--confirmed-by` arg; `strategy_confirmed.confirmed_by` recorded; all
+    agent-facing text + SKILL.md (×3) + SOUL.md (×2) updated. Tested 3 ways.
+  - Follow-up still owed: a deliberate stall test to exercise the STRATEGY
+    re-nudge (300s cooldown) path — the live run advanced too fast to hit it.
 
 ## 5. What to do next
 

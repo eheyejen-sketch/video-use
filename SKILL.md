@@ -134,7 +134,7 @@ and pings the session — at that point a human is needed. Log: `<edit>/jobs/wat
 |---|---|---|---|
 | `pipeline.py init <video>… [--notify-session K --notify-profile P]` | — | create `<video_parent>/edit/` + state; prints the path (don't pass `--edit-dir`) | — |
 | `pipeline.py <dir>` | INGEST | ffprobe → `transcribe.py --verbatim` → `pack_transcripts.py` → `check_fillers.py` → silence-gap table → **`briefing.md`** + 2 sample frames | read `briefing.md`, converse with the user |
-| `pipeline.py <dir> --confirm-strategy` | STRATEGY | check `strategy.md` exists, is substantive, has a `## User confirmation` quote | write `strategy.md` (4–8 sentences + the confirmation section) |
+| `pipeline.py <dir> --confirm-strategy` | STRATEGY | check `strategy.md` exists, is substantive, has a `## User confirmation` quote; **from an agent-started run also requires `--confirmed-by <name>`** | write `strategy.md` (4–8 sentences + the confirmation section); if an agent, present the plan and **stop** — you can't confirm your own strategy |
 | `pipeline.py <dir>` | EDL | schema-check `edl.json`; `render.py --validate-only` (cut-vs-speech); if `strip_fillers` → expand coarse ranges into `edl.effective.json`; refuse on any failure, no `--force` | write `edl.json` per **EDL format** — coarse ranges + `strip_fillers: true` for filler removal |
 | `pipeline.py <dir>` | RENDER | `render.py … --build-subtitles` | nothing — wait |
 | `pipeline.py <dir>` | SELF_EVAL | extract `timeline_view` frames of the **rendered output** at every cut (±1.5s) + head/tail/mids; check duration vs EDL | inspect every `eval/*.png` (see checklist), write findings to `eval/eval_review.md` (one line per frame — `--eval-verdict pass` is refused without it), then `--eval-verdict pass` or `--eval-verdict fail --restage edl\|render` (cap 3 fails) |
@@ -158,13 +158,17 @@ driver owns correctness; you own taste.
 
 `--eval-verdict pass` requires `eval/eval_review.md` (a real per-frame assessment) **and** — when the run was started by an OpenClaw agent — `--reviewer <name>`. An agent-started run refuses `--eval-verdict pass` unconditionally (a text-only model once fabricated a full frame-by-frame review to satisfy the file check); a human or Claude Code inspects the frames, writes the review, and passes it with `--reviewer <name>`. `--eval-verdict fail` is always available.
 
+**`--confirm-strategy` has the same guard.** The `## User confirmation` section is prose the agent wrote, and the pipeline can't tell a real quote from an invented one — on 2026-09-08 an agent wrote `"Go ahead with this plan."` and self-confirmed a plan the user had never seen, ~31 s after being nudged. So `--confirm-strategy` from an agent-started run is refused without `--confirmed-by <name>`, supplied by a human or Claude Code once the user has actually approved. The agent writes `strategy.md`, presents the plan, and stops.
+
 ## If the pipeline refuses
 
 - **`WAITING: …`** — a background job (transcription or render) is still running.
   You'll be notified when it finishes; then re-run `pipeline.py <dir>`. Nothing is wrong.
 - **`REFUSED: … strategy.md …`** — write a real `strategy.md` with a `## User
   confirmation` section quoting the user's plain-English approval. The pipeline will
-  not cut without recorded confirmation.
+  not cut without recorded confirmation. **If you are an agent:** you cannot run
+  `--confirm-strategy` yourself — present the plan, stop, and let a human / Claude
+  Code confirm it with `--confirmed-by <name>` after the user actually approves.
 - **`EDL SCHEMA INVALID:`** — fix the listed structural problems in `edl.json`
   (missing fields, bad paths, start ≥ end, range past source duration).
 - **`CUT VALIDATION FAILED:`** — a range boundary clips a word, or a gap between kept
