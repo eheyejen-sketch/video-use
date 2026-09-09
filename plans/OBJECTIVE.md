@@ -610,3 +610,31 @@ Discord ping to Mike. Human touch = 0 during the run; Mike replies `recut …` o
 
 Earlier this session, before this: the 5 EDL/render gate fixes (commit ba9952e)
 and the nonce (85870ee) — the nonce is now superseded.
+
+## Init-loop + whisper-orphan hardening (2026-09-09, after the aborted live test)
+
+The first unattended-mode live test never got past INGEST. Transcription failed
+(VM overloaded → whisper SIGKILL'd at 98%, "leaked semaphore" trace), Beast read
+the FAILED notify as "start over" and re-ran `pipeline.py init` every ~60s. Each
+iteration `rm -rf`'d the edit dir (deleting `jobs/watch.lock`), so a fresh watcher
++ whisper stacked on the previous. VM load (16 vCPU) hit 13×N; one orphaned
+whisper ran at 1233% CPU for minutes after its parent was killed.
+
+Root: an unthrottled whisper (turbo + word_timestamps) pins all 16 vCPUs on its
+own — ONE job = load 13. Not "the host" — the VM, and whisper is a VM workload.
+
+Fixes (`video-use` `09c5d42`):
+1. `~/.cache/video-use/locks/<hash>.{watch,init}` coord markers — survive
+   `rm -rf <edit-dir>`. `_live_watcher_pid()` + do_watch write/check/release.
+2. `_spawn_watcher` no-ops if a watcher is already live for the edit dir.
+3. `do_init` REFUSES if a watcher is live, or if init ran <150s ago — message
+   points at `pipeline.py <edit-dir>` to resume.
+4. `transcribe.py`: whisper launched `start_new_session=True`, whole process
+   group `SIGKILL`'d on failure/interrupt (no orphans); thread pools capped at 8
+   (`OMP/MKL/OPENBLAS/...`; `VIDEO_USE_WHISPER_THREADS` override).
+Tested: re-init guards fire; second `_spawn_watcher` is a no-op; a real 3s
+transcription completes with ~10 whisper threads (was ~13+), zero orphans.
+
+STILL: the unattended-mode pipeline has not run end-to-end live. Retry when the
+VM is idle (it was at load 1.7 afterward). The whisper throttle should keep a
+single transcription survivable now.

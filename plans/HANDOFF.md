@@ -109,7 +109,7 @@ both SOUL.md** — rewritten for the unattended model: agent writes `strategy.md
 
 ## 5. What to do next
 
-1. **First full LIVE agent run in unattended mode.** Clear `test-beast/edit`.
+1. **First full LIVE agent run in unattended mode.** (Init-loop + whisper-orphan hardening now done, commit 09c5d42 — a failed step no longer lets Beast stack watchers.) Clear `test-beast/edit`.
    Have Beast `init`, then write `strategy.md` (on the STRATEGY nudge) and
    `edl.json` (on the EDL nudge) — nothing else. Confirm the run reaches DONE
    and pings Mike's channel with the `qc_render` verdict, with **zero terminal
