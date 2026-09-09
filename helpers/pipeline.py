@@ -1060,8 +1060,29 @@ def _invalidate_render(edit_dir: Path) -> None:
             p.unlink(missing_ok=True)
 
 
+_RESTAGE_MIN_GAP_S = 90
+
+
 def do_restage(state: dict, target: str) -> None:
     edit_dir = Path(state["edit_dir"])
+
+    # Anti-loop guard: a restage is destructive (it wipes the render + eval
+    # artifacts and re-spawns the watcher). 2026-09-09: an agent ran
+    # `--restage edl` every ~60s, killing each render mid-flight — the same
+    # failure mode as the init loop. A retry is one restage, then let the
+    # pipeline run.
+    rm_marker = _coord_path(edit_dir, "restage")
+    try:
+        age = time.time() - float(rm_marker.read_text().strip())
+    except (ValueError, OSError):
+        age = 1e9
+    if age < _RESTAGE_MIN_GAP_S:
+        sys.exit(f"REFUSED: `--restage` ran {int(age)}s ago. A restage is not a "
+                 f"retry knob — run `pipeline.py {edit_dir}` to let the pipeline "
+                 f"advance (or `--status` to see where it is). Wait "
+                 f"{int(_RESTAGE_MIN_GAP_S - age)}s if you truly need to restage again.")
+    rm_marker.write_text(str(time.time()))
+
     if target in ("strategy", "edl"):
         (edit_dir / "edl.effective.json").unlink(missing_ok=True)  # stale derived cut list
     if target in ("strategy", "edl", "render"):
