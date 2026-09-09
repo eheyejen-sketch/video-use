@@ -134,7 +134,7 @@ and pings the session — at that point a human is needed. Log: `<edit>/jobs/wat
 |---|---|---|---|
 | `pipeline.py init <video>… [--notify-session K --notify-profile P]` | — | create `<video_parent>/edit/` + state; prints the path (don't pass `--edit-dir`) | — |
 | `pipeline.py <dir>` | INGEST | ffprobe → `transcribe.py --verbatim` → `pack_transcripts.py` → `check_fillers.py` → silence-gap table → **`briefing.md`** + 2 sample frames | read `briefing.md`, converse with the user |
-| `pipeline.py <dir> --confirm-strategy` | STRATEGY | check `strategy.md` exists, is substantive, has a `## User confirmation` quote; **from an agent-started run also requires `--confirmed-by <name>`** | write `strategy.md` (4–8 sentences + the confirmation section); if an agent, present the plan and **stop** — you can't confirm your own strategy |
+| `pipeline.py <dir> --confirm-strategy` | STRATEGY | check `strategy.md` exists, is substantive, has a `## User confirmation` quote; **from an agent-started run also requires `--confirmed-by <name>` AND `--nonce <value>` (from a file the agent can't read)** | write `strategy.md` (4–8 sentences + the confirmation section); if an agent, present the plan and **stop** — you can't confirm your own strategy |
 | `pipeline.py <dir>` | EDL | schema-check `edl.json`; `render.py --validate-only` (cut-vs-speech); if `strip_fillers` → expand coarse ranges into `edl.effective.json`; refuse on any failure, no `--force` | write `edl.json` per **EDL format** — coarse ranges + `strip_fillers: true` for filler removal |
 | `pipeline.py <dir>` | RENDER | `render.py … --build-subtitles` | nothing — wait |
 | `pipeline.py <dir>` | SELF_EVAL | extract `timeline_view` frames of the **rendered output** at every cut (±1.5s) + head/tail/mids; check duration vs EDL | inspect every `eval/*.png` (see checklist), write findings to `eval/eval_review.md` (one line per frame — `--eval-verdict pass` is refused without it), then `--eval-verdict pass` or `--eval-verdict fail --restage edl\|render` (cap 3 fails) |
@@ -156,19 +156,19 @@ driver owns correctness; you own taste.
 - the intended background swap / grade actually took effect (a matte can "succeed" and change nothing — verify visually)
 - grade consistency, subtitle readability, overall coherence (head/tail/mid frames)
 
-`--eval-verdict pass` requires `eval/eval_review.md` (a real per-frame assessment) **and** — when the run was started by an OpenClaw agent — `--reviewer <name>`. An agent-started run refuses `--eval-verdict pass` unconditionally (a text-only model once fabricated a full frame-by-frame review to satisfy the file check); a human or Claude Code inspects the frames, writes the review, and passes it with `--reviewer <name>`. `--eval-verdict fail` is always available.
+**Two gates an agent-started run cannot pass itself — STRATEGY confirm and SELF_EVAL pass.** For each, the pipeline writes a random nonce to `~/.video-use-gate/<hash>/<phase>.nonce` (a file outside the edit dir; an OpenClaw agent has no way to read it) and the confirm command needs `--nonce <value>` from that file plus `--confirmed-by`/`--reviewer <name>`:
 
-**`--confirm-strategy` has the same guard.** The `## User confirmation` section is prose the agent wrote, and the pipeline can't tell a real quote from an invented one — on 2026-09-08 an agent wrote `"Go ahead with this plan."` and self-confirmed a plan the user had never seen, ~31 s after being nudged. So `--confirm-strategy` from an agent-started run is refused without `--confirmed-by <name>`, supplied by a human or Claude Code once the user has actually approved. The agent writes `strategy.md`, presents the plan, and stops.
+- `pipeline.py <dir> --confirm-strategy --confirmed-by <name> --nonce "$(cat ~/.video-use-gate/<hash>/strategy.nonce)"`
+- `pipeline.py <dir> --eval-verdict pass --reviewer <name> --nonce "$(cat ~/.video-use-gate/<hash>/self_eval.nonce)"` (also needs a real `eval/eval_review.md`)
+
+An earlier version gated only on `--confirmed-by`/`--reviewer` being *present* — an agent just typed them (2026-09-08: an agent wrote `"Go ahead with this plan."` into `strategy.md`, passed `--confirmed-by mike` itself, and drove the whole pipeline; and separately fabricated a frame-by-frame review to pass SELF_EVAL). The nonce closes that: only a human or Claude Code can `cat` the file. `--eval-verdict fail` stays open to the agent. `pipeline.py <dir> --status` and the STRATEGY / SELF_EVAL output print the exact one-paste command with the `$(cat …)` filled in. A non-agent-started run (Claude Code drove `init`) needs no nonce.
 
 ## If the pipeline refuses
 
 - **`WAITING: …`** — a background job (transcription or render) is still running.
   You'll be notified when it finishes; then re-run `pipeline.py <dir>`. Nothing is wrong.
-- **`REFUSED: … strategy.md …`** — write a real `strategy.md` with a `## User
-  confirmation` section quoting the user's plain-English approval. The pipeline will
-  not cut without recorded confirmation. **If you are an agent:** you cannot run
-  `--confirm-strategy` yourself — present the plan, stop, and let a human / Claude
-  Code confirm it with `--confirmed-by <name>` after the user actually approves.
+- **`REFUSED: … strategy.md …`** / **`REFUSED: an agent-started run cannot confirm its own strategy`** — write a real `strategy.md` with a `## User confirmation` section quoting the user's plain-English approval, then **if you are an agent: present the plan and stop.** You cannot run `--confirm-strategy` — a human / Claude Code confirms it with `--confirmed-by <name> --nonce "$(cat …)"` (the pipeline prints the exact line) after the user actually approves.
+- **`EDL NOT ACCEPTED — it does not express the edit you intend`** — either an `omissions` entry sits inside your kept ranges (it cuts nothing — move a range boundary instead), or your ranges keep ≥95 % of the source and rely on `strip_fillers` (that's not an edit — select tight content ranges). The message says which.
 - **`EDL SCHEMA INVALID:`** — fix the listed structural problems in `edl.json`
   (missing fields, bad paths, start ≥ end, range past source duration).
 - **`CUT VALIDATION FAILED:`** — a range boundary clips a word, or a gap between kept
@@ -376,9 +376,13 @@ Match the source unless the user asked for something specific. Common targets: `
 
 `grade` is a preset name or raw ffmpeg filter. `overlays` are rendered animation clips. `subtitles` is optional and applied LAST.
 
+**`sources` / `background` paths must be ABSOLUTE.** A bare filename in `background` is rejected at the EDL gate (it used to render with the swap silently skipped — 2026-09-08). Point it at the real file, usually beside the source video.
+
 **`strip_fillers`** (bool, default false) — to remove filler words, set this `true` and author **coarse** structural `ranges` (keep the content you want; do **not** try to cut individual um/uh yourself — you'll get the timestamps wrong and burn your token budget on 18 micro-ranges). After the EDL passes, `pipeline.py` expands your ranges into `edl.effective.json`, splitting each range around every filler word from `check_fillers.py`'s exact timestamps (±40 ms). That's what renders. `edl.json` stays as your intent; `project.md` records "N coarse → M effective ranges".
 
-**`omissions`** — for each region of *speech* your edit removes on purpose (the gap between two kept ranges, or speech before the first / after the last range), add one entry with a `reason`. The entry only has to **overlap** that gap — approximate `start`/`end` are fine, you're acknowledging the cut, not bounding it to the decimal. Without any overlapping entry the gate rejects the cut as `UNDECLARED SPEECH REMOVAL`. This is for **content** you drop (a tangent, a retake, a bad outro) — not fillers, which `strip_fillers` handles. The 2026-09-07 incident deleted real sentences the editor believed were silence. A pure trim with one continuous range needs no `omissions`. `render.py --force` bypasses the check for direct manual use — `pipeline.py` never uses it; declare instead.
+**`strip_fillers` is NOT the edit.** It only deletes literal `um`/`uh`-family tokens. It does nothing about dead space, rambling, "you know", false starts, or repeated content — that is what your `ranges` are for. An EDL that keeps ≥95 % of the source and leans on `strip_fillers` is rejected. A real cut selects tight content ranges (the working runs kept ~60 %).
+
+**`omissions` DO NOT CUT.** They only *acknowledge* speech that your `ranges` already drop, so the cut validator lets it through. An `omissions` entry that lies **inside** your kept ranges removes nothing and is rejected. To drop a span, END a range before it and START the next range after it — the span between kept ranges is the cut. Add one `omissions` entry (with a `reason`) per such gap; it only has to **overlap** the gap, approximate `start`/`end` are fine. Without an overlapping entry the gate rejects the cut as `UNDECLARED SPEECH REMOVAL`. This is for **content** you drop (a tangent, a retake, a bad outro) — not fillers. The 2026-09-07 incident deleted real sentences the editor believed were silence; the 2026-09-08 incident kept a whole "wall of uh" section because the editor put it in `omissions` and thought that cut it. A pure trim with one continuous range needs no `omissions`. `render.py --force` bypasses the check for direct manual use — `pipeline.py` never uses it; declare instead.
 
 ## Memory — `project.md`
 

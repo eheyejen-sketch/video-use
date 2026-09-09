@@ -146,6 +146,11 @@ DONE. Beast's contribution: 2 nudged artifacts. A stall between them self-heals.
       drew a Beast turn; watcher exited cleanly at SELF_EVAL.
 - [x] STRATEGY confirmation self-certification hole found on that run and fixed
       (`--confirmed-by` gate — see section above).
-- [ ] Follow-up live test: deliberately stall mid-STRATEGY → confirm the watcher
-      re-nudges at the 300 s cooldown and a fresh turn completes it. (Not yet
-      done — the live run advanced too fast to exercise the re-nudge path.)
+- [x] Follow-up live test — DONE (2nd Beast run, 2026-09-08 23:00–23:16). LM
+      Studio threw "provider internal error" on the STRATEGY turn; the watcher
+      re-nudged at exactly the 300 s cooldown (nudges 1–4), and once LM Studio
+      was fixed the next nudge produced the strategy.md turn. Self-heal works.
+- [ ] The `--confirmed-by` gate the 1st run relied on was bypassable (the agent
+      just typed the flag). Replaced with an out-of-band nonce — see
+      OBJECTIVE.md "FINDING 1". Mike to review the mechanism (OpenClaw 2026.8.2
+      has no argPattern, so the flag can't be blocked at the exec layer).

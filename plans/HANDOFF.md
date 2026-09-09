@@ -182,14 +182,46 @@ stable; it will relaunch transcription off the failed lock. (The AVIF *is* in
   - Follow-up still owed: a deliberate stall test to exercise the STRATEGY
     re-nudge (300s cooldown) path — the live run advanced too fast to hit it.
 
+## 4b. Overnight 2026-09-08 → 09 (Claude Code, autonomous per "fix all five")
+
+Two live Beast runs done. Watcher fully proven (INGEST/RENDER self-advance;
+STRATEGY/EDL nudges each drew a Beast turn in 15–31s; the 300s STRATEGY re-nudge
+self-heal path got exercised for real when LM Studio flaked). LM Studio flake was
+8 models loaded at once — Claude Code unloaded the extras via the `/api/v1/models/unload`
+REST call; qwen3.6 healthy.
+
+**Five fixes shipped, tested, committed** (see OBJECTIVE.md for the detail):
+1. **`--confirmed-by` / `--reviewer` were bypassable** (Beast passed `--confirmed-by mike`
+   itself and drove the whole pipeline). OpenClaw 2026.8.2 exec-approvals are
+   glob-prefix only — no argPattern to block a flag. FIX: an out-of-band **nonce**
+   in `~/.video-use-gate/<hash>/<phase>.nonce` (0600, outside the edit dir; an
+   agent has no file-read primitive). `--confirm-strategy` / `--eval-verdict pass`
+   from an agent-started run now need `--nonce <value>` too. `--status` prints the
+   ready-to-paste line. Non-agent runs unaffected. **Mike: this is not the
+   "argPattern" you pictured — that feature doesn't exist in 2026.8.2. Contained,
+   fails safe, clean to revert if you want a different design.**
+2. `omissions` fully inside kept ranges → REFUSE at EDL gate (`omissions` annotate,
+   don't cut — Beast thought they cut a "wall of uh" section; it rendered).
+3. `background` bare filename → `render.resolve_asset_path()` now also checks the
+   edit-dir parent / source dirs; a truly-missing bg → REFUSE at the EDL gate
+   ("use an ABSOLUTE path").
+4. `build_master_srt()` drops all-filler caption cues and (with `strip_fillers`)
+   filler words entirely — no more "UH/UM" caption burst.
+5. Ranges keeping ≥95% of source + `strip_fillers` → REFUSE ("that's not an edit").
+
+SKILL.md (canonical + both scoped) + both SOUL.md updated accordingly.
+
 ## 5. What to do next
 
-0. **Live-test the watcher on a real agent run.** Start a Jensen/Beast edit (it
-   auto-spawns the watcher). Tail `<edit>/jobs/watch.log` and confirm: (a) INGEST
-   and RENDER self-advance; (b) a STRATEGY/EDL nudge logs `sent=True` **and**
-   actually triggers an agent turn; (c) a deliberately-broken `edl.json` draws
-   the reject nudge and a fixed one advances. If nudges send but don't wake the
-   agent, swap the transport per AUTO-ADVANCE-DESIGN.md's build checklist.
+0. **Mike reviews FIX 1's nonce mechanism** (OBJECTIVE.md "FINDING 1"). It works
+   and is deployed; the question is whether the design is what he wants given the
+   argPattern route doesn't exist.
+1. **Re-run test-beast once more** — with the 5 fixes, a lazy full-source EDL is
+   now rejected, so Beast has to author real content ranges. Watch whether the
+   nudge guidance is enough for it to produce a tight 3–4 range EDL with an
+   absolute bg path.
+2. `test-beast/edit` currently holds the bad 64.7s render (fabricated-plan, no bg
+   swap, filler captions). Scrap it and re-`init` for the next run.
 1. **Close the objective (needs Mike).** Walk `plans/OBJECTIVE.md` criterion by
    criterion. The 3 OPEN directives in the log ("use a script", "the more robust
    fix", "make it work beginning to end") are satisfied — the driver exists and ran

@@ -128,6 +128,40 @@ def resolve_path(maybe_path: str, base: Path) -> Path:
     return (base / p).resolve()
 
 
+def resolve_asset_path(ref: str, edit_dir: Path, edl: dict | None = None) -> Path | None:
+    """Resolve an EDL asset reference (e.g. `background`) that an agent may have
+    written as a bare filename. Tries, in order: as-given / absolute; under the
+    edit dir; under the edit dir's parent (where the source video lives — agents
+    routinely drop the bg image beside the video and reference it by name); the
+    directory of the first source in the EDL; then a shallow search for the
+    basename under the edit-dir parent. Returns the first hit, or None.
+
+    The old behaviour (resolve only against edit_dir) silently no-op'd the
+    background swap when the file sat beside the source video — 2026-09-08."""
+    if not ref:
+        return None
+    cand: list[Path] = []
+    p = Path(ref)
+    cand.append(p if p.is_absolute() else (edit_dir / p))
+    cand.append(edit_dir.parent / p.name)
+    if edl:
+        for sp in (edl.get("sources") or {}).values():
+            cand.append(Path(sp).parent / p.name)
+    for c in cand:
+        try:
+            if c.exists():
+                return c.resolve()
+        except OSError:
+            continue
+    try:
+        for hit in sorted(edit_dir.parent.glob(f"**/{p.name}")):
+            if hit.is_file():
+                return hit.resolve()
+    except OSError:
+        pass
+    return None
+
+
 # -------- HDR → SDR tone mapping (HLG / PQ sources) --------------------------
 #
 # iPhone defaults to HLG HDR in Rec.2020 (and many mirrorless cameras ship PQ).
@@ -491,9 +525,11 @@ def apply_background_matte(base_path: Path, bg_ref: str, edit_dir: Path) -> Path
     the new base path to use downstream; on failure, prints a warning and
     returns the original `base_path` unchanged rather than aborting the render.
     """
-    bg_path = resolve_path(bg_ref, edit_dir)
-    if not bg_path.exists():
-        print(f"warning: background path in EDL does not exist, skipping matte: {bg_path}")
+    bg_path = resolve_asset_path(bg_ref, edit_dir)
+    if bg_path is None:
+        print(f"warning: background {bg_ref!r} not found (looked beside the edit dir, "
+              f"the source video, and the sources) — skipping matte, background NOT "
+              f"swapped. This should have been caught at the EDL gate.")
         return base_path
 
     matte_script = Path(__file__).parent / "matte.py"
@@ -583,6 +619,14 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
         transcript = json.loads(tr_path.read_text())
         words_in_seg = _words_in_range(transcript, seg_start, seg_end)
 
+        # strip_fillers removes filler words from the AUDIO; the captions must
+        # match. Drop them here too, or the burned-in SRT still flashes "UH" /
+        # "UM" cues over the cleaned audio (2026-09-08: a strip_fillers render
+        # ended on a burst of standalone filler captions).
+        if edl.get("strip_fillers"):
+            words_in_seg = [w for w in words_in_seg
+                            if _norm_word(w.get("text") or "") not in FILLER_WORDS]
+
         # Group into 2-word chunks, break on punctuation
         chunks: list[list[dict]] = []
         current: list[dict] = []
@@ -611,6 +655,12 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
             # Strip trailing punctuation for cleaner uppercase look
             text = text.rstrip(",;:")
             text = text.upper()
+            # A caption that is nothing but filler words ("UH", "UM UH") is
+            # never wanted — happens with zero-duration ASR filler tokens that
+            # strip_fillers can't cut. Drop the cue.
+            toks = [t for t in re.split(r"\s+", text) if t]
+            if toks and all(_norm_word(t) in FILLER_WORDS for t in toks):
+                continue
             entries.append((out_start, out_end, text))
 
         seg_offset += seg_duration
@@ -1007,15 +1057,40 @@ def main() -> None:
                 print(f"CUT VALIDATION FAILED:\n  - could not read EDL: {e}")
             sys.exit(1)
         cut_warnings = validate_cuts_against_transcripts(edl, edit_dir)
+        cut_records = [_classify_cut_warning(w) for w in cut_warnings]
+
+        # Asset references (background / subtitles file) must resolve, or the
+        # render silently skips them -- 2026-09-08 a bare-filename `background`
+        # produced an un-swapped output with only a buried render-time warning.
+        asset_records: list[dict] = []
+        bg = edl.get("background")
+        if bg and resolve_asset_path(bg, edit_dir, edl) is None:
+            asset_records.append({
+                "kind": "background", "source": None, "start": None, "end": None,
+                "message": f"background {bg!r} does not resolve to a file (looked "
+                           f"beside the edit dir, the source video, and the sources). "
+                           f"The swap would be silently skipped. Use an absolute path "
+                           f"or place the file beside the source video.",
+            })
+        subs = edl.get("subtitles")
+        if isinstance(subs, str) and subs and not resolve_path(subs, edit_dir).exists():
+            asset_records.append({
+                "kind": "subtitles", "source": None, "start": None, "end": None,
+                "message": f"subtitles file {subs!r} does not exist; captions would "
+                           f"be skipped. Omit the field to auto-build from transcripts.",
+            })
+
+        records = cut_records + asset_records
         if args.json:
-            print(json.dumps([_classify_cut_warning(w) for w in cut_warnings]))
-            sys.exit(1 if cut_warnings else 0)
-        if cut_warnings:
-            print("CUT VALIDATION FAILED:")
-            for w in cut_warnings:
-                print(f"  - {w}")
+            print(json.dumps(records))
+            sys.exit(1 if records else 0)
+        if records:
+            print("VALIDATION FAILED:")
+            for r in records:
+                print(f"  - {r['message']}")
             sys.exit(1)
-        print("CUT VALIDATION OK: no range clips a word, no gap contains real speech.")
+        print("VALIDATION OK: cuts land in silence, all removed speech declared, "
+              "assets resolve.")
         sys.exit(0)
 
     if args.output is None:
