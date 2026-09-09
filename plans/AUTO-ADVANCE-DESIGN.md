@@ -1,5 +1,17 @@
 # Design — `pipeline.py --watch`: auto-advance the video-use pipeline
 
+_**2026-09-09 update — the model went fully unattended.** The design below still
+describes the watcher's mechanics accurately, but the two human gates it nudged
+for (STRATEGY confirm, SELF_EVAL sighted review) are GONE for agent runs: STRATEGY
+auto-advances once `strategy.md` exists, and SELF_EVAL runs `qc_render.py` (a
+deterministic render QC — no vision model) then finishes and pings the user. An
+agent run is now `init → DONE` with no human touch; the user reviews the finished
+video. `describe_frames.py` (a local-VLM reviewer) was tried and abandoned — see
+`plans/OBJECTIVE.md` 2026-09-09. Ignore the nonce / `--confirmed-by` / `--reviewer`
+material below; removed._
+
+---
+
 _Written 2026-09-08. **Status: BUILT + VERIFIED LIVE 2026-09-08.** A full Beast run
 (`test-beast`, 22:16–22:27) went INGEST→STRATEGY→EDL→RENDER→SELF_EVAL entirely on
 the watcher: 2 nudges (STRATEGY, EDL), both `sent=True`, **both produced a Beast

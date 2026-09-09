@@ -567,3 +567,46 @@ NOTE for Mike: FIX 1's mechanism differs from the "argPattern" you pictured —
 2026.8.2 has no such feature. The nonce approach is contained (all in
 pipeline.py, no exec-approvals DB change, no new scripts, fails safe — a human
 always has a path). If you want a different mechanism it's a clean revert.
+
+## Fully-unattended agent runs — the human gates removed (2026-09-09)
+
+Mike's decision after the nonce friction: **review the finished video, not the
+plan.** He may upload a video from his phone, so the whole run must go
+init → DONE with zero terminal interaction. This dissolves the "agent can't
+self-certify" problem — there's no human-confirm command left to fake.
+
+Shipped (`video-use` 9b1d6ec):
+- **STRATEGY confirm gate: removed for agent runs.** Once `strategy.md` exists
+  (≥200 chars) the driver auto-advances to EDL, like INGEST→STRATEGY. The agent
+  posts its plan to Mike for visibility only. `--confirm-strategy` stays as a
+  manual checkpoint for Claude-Code-driven edits.
+- **SELF_EVAL: automated via `helpers/qc_render.py` (NEW).** Deterministic render
+  QC, ~0.2s, no vision model: output duration vs EDL, final.mp4 stream
+  integrity, background-swap log line (`render.py` prints "background matte …→"
+  on success / "warning: background …" on failure), caption sanity (cue count,
+  in-bounds, no pure-filler cues, abrupt-end heuristic). Writes
+  `eval/eval_review.md`; the pipeline sets the verdict (pass / issues /
+  unreviewed), finishes, and pings Mike: `✅ edit ready` / `⚠️ edit ready` +
+  flagged issues (reply `recut …` / `ship it`) / `QC couldn't run, eyeball it`.
+  Tested: PASSes the clean test-beast render; flags a tampered fixture on all
+  four regression classes (duration, bg swap, broken captions, filler cues).
+- **A local VLM was tried first (`describe_frames.py`) and abandoned:** qwen3.6
+  (both the `-vl-oq8` quant and the base) burns its whole token budget on
+  unsuppressable reasoning → empty `content` on image calls, and each call runs
+  20–90s (~15 min for one edit). `/no_think` helps marginally, not enough.
+  Deterministic checks are faster and reliable; Mike reviews the video for
+  taste anyway.
+- **Removed:** the out-of-band nonce + `~/.video-use-gate`, `--nonce`,
+  `--confirmed-by`, `_gate_nonce_*`, `_AGENT_SELF_EVAL_NOTE`, the watcher's
+  `_watch_self_eval` + STRATEGY-confirm nudge. SELF_EVAL now routes through the
+  same `_watch_job_phase` self-advance path as INGEST/RENDER.
+- `qc_render.py` on both agents' exec allowlists; baselines regenerated.
+  SKILL.md (canonical + both scoped) + both SOUL.md rewritten for the new model.
+
+Net agent-run flow: `init` → transcription → auto STRATEGY (write strategy.md,
+post plan) → EDL nudge (write edl.json) → auto RENDER → auto qc_render → DONE +
+Discord ping to Mike. Human touch = 0 during the run; Mike replies `recut …` or
+`ship it` to the ping.
+
+Earlier this session, before this: the 5 EDL/render gate fixes (commit ba9952e)
+and the nonce (85870ee) — the nonce is now superseded.
