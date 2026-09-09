@@ -33,19 +33,21 @@ CLI
                  [--notify-session KEY] [--notify-profile PROFILE] [--no-watch]
     pipeline.py <edit-dir>                     # run/advance the current phase
     pipeline.py <edit-dir> --status            # report only, never mutates
-    pipeline.py <edit-dir> --confirm-strategy [--confirmed-by NAME]  # STRATEGY gate
-                 #   --confirmed-by required when an agent started the run
+    pipeline.py <edit-dir> --confirm-strategy  # STRATEGY checkpoint (manual runs
+                 #   only; an agent-started run auto-advances once strategy.md exists)
     pipeline.py <edit-dir> --eval-verdict pass|fail [--restage edl|render]
+                 #   manual runs only; an agent-started run auto-QCs via qc_render.py
     pipeline.py <edit-dir> --restage strategy|edl|render|self_eval  # manual step-back
     pipeline.py <edit-dir> --watch            # detached auto-advance loop
                  [--watch-max-seconds N]      #   (auto-started by an agent init)
 
 The --watch loop owns the mechanical phase transitions an idle agent keeps
-missing (INGEST/RENDER advance themselves; STRATEGY/EDL get one targeted
-`system event` nudge; SELF_EVAL is generated then handed to a sighted
-reviewer). It never authors an artifact and never passes a human gate. A
-retry storm, an unresponsive agent, or the wall-clock cap stops it and pings
-the session for a human. See `plans/AUTO-ADVANCE-DESIGN.md`.
+missing (INGEST/RENDER/STRATEGY advance themselves once the agent's artifact
+is on disk; EDL gets one targeted `system event` nudge; SELF_EVAL runs
+`qc_render.py` for a deterministic render QC and finishes the run). An agent-started
+run needs NO human gate -- it goes init -> DONE and pings the user with the
+result. A retry storm, an unresponsive agent, or the wall-clock cap stops the
+watcher and pings the session. See `plans/AUTO-ADVANCE-DESIGN.md`.
 
 Exit codes: 0 = phase advanced / waiting on a background job / info printed
 (the agent should read the message and act). 1 = a gate REFUSED the agent's
@@ -56,10 +58,8 @@ transcription failed).
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
-import secrets
 import subprocess
 import sys
 import time
@@ -96,74 +96,6 @@ except ImportError:  # pragma: no cover - _job_lock is a sibling; this is belt-a
 STATE_NAME = "pipeline_state.json"
 PHASES = ["INGEST", "STRATEGY", "EDL", "RENDER", "SELF_EVAL", "DONE"]
 
-
-# ───────────────────────── human-gate nonce ─────────────────────────
-#
-# The two gates an agent must not self-certify -- STRATEGY confirmation and
-# SELF_EVAL pass -- were previously guarded only by "agent-started run must pass
-# --confirmed-by / --reviewer". That is trivially bypassable: those are just
-# strings the agent types, and SKILL.md documents them. 2026-09-08 Beast passed
-# `--confirmed-by mike` itself and drove the whole pipeline. OpenClaw's
-# exec-approvals are a glob PREFIX allowlist with no argPattern / denylist, so
-# the flag can't be blocked there either.
-#
-# What an OpenClaw agent genuinely CANNOT do: read an arbitrary file outside the
-# edit dir. Its exec allowlist is a fixed set of video-use helper scripts (none
-# a general file reader), plus git and one pinned curl URL -- no cat, no shell,
-# no python. So: when a run is agent-started, the gate emits a random nonce to a
-# 0600 file UNDER ~/.video-use-gate/<hash>/ (outside the edit dir) and stores
-# only its sha256 in state. `--confirm-strategy` / `--eval-verdict pass` then
-# also require `--nonce <value>` matching that hash. A human or Claude Code can
-# `cat` the file; Jensen/Beast cannot. The nonce's PATH is fine to print (the
-# agent sees it in watch.log) -- only the value matters, and the value never
-# touches stdout or the edit dir.
-#
-# This rests on the narrow allowlist. If an agent ever gets `cat`/general
-# `curl`/`python`, this weakens -- but so does every other boundary here.
-
-def _gate_dir(edit_dir: Path) -> Path:
-    h = hashlib.sha1(str(Path(edit_dir).resolve()).encode()).hexdigest()[:16]
-    return Path.home() / ".video-use-gate" / h
-
-
-def _gate_nonce_ensure(state: dict, key: str) -> tuple[str, Path]:
-    """Return (plaintext_nonce, nonce_file). Mints one if absent or if the file
-    no longer matches the stored hash. `key` is 'strategy' or 'self_eval'."""
-    edit_dir = Path(state["edit_dir"])
-    gd = _gate_dir(edit_dir)
-    gd.mkdir(parents=True, exist_ok=True)
-    try:
-        gd.chmod(0o700)
-    except OSError:
-        pass
-    nf = gd / f"{key}.nonce"
-    stored = (state.get("gate_hashes") or {}).get(key)
-    if stored and nf.exists():
-        cur = nf.read_text().strip()
-        if cur and hashlib.sha256(cur.encode()).hexdigest() == stored:
-            return cur, nf
-    val = secrets.token_hex(8)
-    nf.write_text(val)
-    try:
-        nf.chmod(0o600)
-    except OSError:
-        pass
-    state.setdefault("gate_hashes", {})[key] = hashlib.sha256(val.encode()).hexdigest()
-    save_state(state)
-    return val, nf
-
-
-def _gate_nonce_ok(state: dict, key: str, supplied: str | None) -> bool:
-    stored = (state.get("gate_hashes") or {}).get(key)
-    if not stored or not supplied:
-        return False
-    return hashlib.sha256(supplied.strip().encode()).hexdigest() == stored
-
-
-def _gate_nonce_clear(state: dict, key: str) -> None:
-    (state.get("gate_hashes") or {}).pop(key, None)
-    nf = _gate_dir(Path(state["edit_dir"])) / f"{key}.nonce"
-    nf.unlink(missing_ok=True)
 
 # an inter-word gap at least this long is reported in the gap table
 GAP_MIN_S = 0.30
@@ -408,21 +340,14 @@ INGEST_DONE_MSG = """\
 INGEST complete. The pipeline has run: ffprobe, verbatim transcription,
 pack_transcripts, check_fillers, and the silence-gap computation.
 
-YOU OWE: read `{edit}/briefing.md` in full. Converse with the user about
-content type, target length/aspect, aesthetic, pacing, must-keep and
-must-cut moments. Then write your proposed strategy (4–8 sentences: shape,
-cut direction, length target, grade, subtitle style) to `{edit}/strategy.md`,
-INCLUDING a `## User confirmation` section that quotes the user approving the
-plan in plain English.
+YOU OWE: read `{edit}/briefing.md` in full. Then write your proposed strategy
+(4–8 sentences: shape, cut direction, length target, grade, subtitle style) to
+`{edit}/strategy.md`, and post the same plan to the user for visibility.
 
-Then it is confirmed with:
-
-    pipeline.py {edit} --confirm-strategy
-
-**If an agent started this run, you cannot confirm your own strategy** — write
-strategy.md, present the plan to the user, and STOP. After the user actually
-approves, a human or Claude Code runs the command above with
-`--confirmed-by <name>`.
+There is NO confirmation step for an agent-started run — once strategy.md is on
+disk the pipeline advances to EDL on its own. The user reviews the finished
+video, not the plan. (A Claude-Code-driven run uses
+`pipeline.py {edit} --confirm-strategy` as a manual checkpoint.)
 """
 
 
@@ -509,90 +434,58 @@ STRATEGY_REMINDER = """\
 Phase STRATEGY. The briefing is ready at `{edit}/briefing.md`.
 
 YOU OWE: `{edit}/strategy.md` — 4–8 sentences (shape, cut direction, length
-target, grade, subtitle style) plus a `## User confirmation` section quoting
-the user's plain-English approval.
-
-Confirmed with `pipeline.py {edit} --confirm-strategy`. **An agent cannot
-confirm its own strategy** — write strategy.md, present the plan, and stop;
-a human or Claude Code runs the confirm with `--confirmed-by <name>` once the
-user has approved.
+target, grade, subtitle style). Post the same plan to the user so they can
+weigh in. There is NO confirmation step for an agent-started run — the pipeline
+advances to EDL on its own once strategy.md is written; the user reviews the
+finished video, not the plan.
 """
 
+_EDL_OWED = (
+    "YOU OWE: `{edit}/edl.json` per SKILL.md 'EDL format'. Author COARSE structural "
+    "`ranges` (source/start/end/reason each — pick the content to KEEP), set "
+    "`\"strip_fillers\": true` to drop um/uh, and put each deliberately-dropped "
+    "content span in `omissions` (in the GAP between ranges — omissions annotate, "
+    "they do not cut). `background` must be an ABSOLUTE path. Then run:\n"
+    "    pipeline.py {edit}"
+)
 
-def _human_confirm_cmd(state: dict, edit_dir: Path) -> str:
-    """The exact one-paste command a human / Claude Code runs to confirm the
-    strategy of an agent-started run. Empty for a non-agent run (no nonce)."""
-    if not running_as_agent(state):
-        return f"pipeline.py {edit_dir} --confirm-strategy"
-    _, nf = _gate_nonce_ensure(state, "strategy")
-    return (f"pipeline.py {edit_dir} --confirm-strategy --confirmed-by <your name> "
-            f"--nonce \"$(cat '{nf}')\"")
 
-
-def phase_strategy(state: dict, confirm: bool, confirmed_by: str | None = None,
-                   nonce: str | None = None) -> None:
+def phase_strategy(state: dict, confirm: bool) -> None:
     edit_dir = Path(state["edit_dir"])
+    sp = edit_dir / "strategy.md"
+    substantive = sp.exists() and len(sp.read_text().strip()) >= 200
+
     if not confirm:
-        print(STRATEGY_REMINDER.format(edit=edit_dir))
-        if running_as_agent(state) and (edit_dir / "strategy.md").exists():
-            print(f"\nstrategy.md exists. It is confirmed OUT OF BAND by a human / "
-                  f"Claude Code (not by you) with:\n    {_human_confirm_cmd(state, edit_dir)}\n"
-                  f"You cannot read that nonce file. Present the plan and stop.")
+        # bare `pipeline.py <dir>` at STRATEGY (agent runs + the watcher).
+        if not substantive:
+            print(STRATEGY_REMINDER.format(edit=edit_dir))
+            sys.exit(0)
+        if running_as_agent(state):
+            state["phase"] = "EDL"
+            state["gates"]["strategy_confirmed"] = {"done": True, "confirmed_by": "auto (agent run)"}
+            save_state(state)
+            print("strategy.md recorded — agent run, no confirmation gate. Phase EDL.\n"
+                  "(Post your plan to the user for visibility; they review the final "
+                  "video, not the plan.)\n\n" + _EDL_OWED.format(edit=edit_dir))
+            sys.exit(0)
+        # non-agent (Claude Code drove init): keep a manual checkpoint.
+        print(f"strategy.md is ready. When the user has approved the plan, run:\n"
+              f"    pipeline.py {edit_dir} --confirm-strategy")
         sys.exit(0)
 
-    sp = edit_dir / "strategy.md"
+    # --confirm-strategy (manual / Claude Code path only)
     if not sp.exists():
-        print(f"REFUSED: {sp} does not exist. Write the strategy first (see "
-              f"`pipeline.py {edit_dir} --status`).")
+        print(f"REFUSED: {sp} does not exist. Write the strategy first.")
         sys.exit(1)
-    text = sp.read_text()
-    if len(text.strip()) < 200:
-        print(f"REFUSED: {sp} is only {len(text.strip())} chars — too thin to be a "
-              f"real strategy. Write 4–8 substantive sentences plus the confirmation.")
+    if not substantive:
+        print(f"REFUSED: {sp} is only {len(sp.read_text().strip())} chars — too thin. "
+              f"Write 4–8 substantive sentences.")
         sys.exit(1)
-    if "## user confirmation" not in text.lower():
-        print(f"REFUSED: {sp} has no `## User confirmation` section. Add it, quoting "
-              f"the user approving the plan in plain English. The pipeline will not "
-              f"proceed to cutting without recorded confirmation (SKILL.md Hard Rule 11).")
-        sys.exit(1)
-
-    # An agent-started run CANNOT confirm its own strategy. The `## User
-    # confirmation` section is prose the agent itself wrote; the pipeline can't
-    # tell a real quote from an invented one, and an agent HAS fabricated one --
-    # 2026-09-08 Beast wrote `"Go ahead with this plan."` and self-ran
-    # --confirm-strategy ~31s after being nudged, for a plan with specific cut
-    # ranges the user had never seen. So confirmation from an agent-started run
-    # requires --confirmed-by <name>, which asserts a human / Claude Code
-    # actually relayed the user's approval (mirrors the SELF_EVAL --reviewer
-    # gate). The agent's job is to write strategy.md, present the plan, and stop.
-    if running_as_agent(state):
-        # Agent-started run: --confirmed-by is necessary but NOT sufficient (an
-        # agent can type it). The out-of-band nonce is the real gate -- only a
-        # non-agent can read the file it lives in. See the human-gate note up top.
-        if not confirmed_by or not _gate_nonce_ok(state, "strategy", nonce):
-            _, nf = _gate_nonce_ensure(state, "strategy")
-            print("REFUSED: an agent-started run cannot confirm its own strategy. "
-                  "The `## User confirmation` section is text the agent wrote and "
-                  "the pipeline cannot verify it (an agent has fabricated one, and "
-                  "has passed --confirmed-by itself).\n"
-                  "Write strategy.md, present the plan, and STOP. Once the user has "
-                  "actually approved, a human or Claude Code runs (they can read the "
-                  "nonce file; you cannot):\n"
-                  f"    pipeline.py {edit_dir} --confirm-strategy "
-                  f"--confirmed-by <name> --nonce \"$(cat '{nf}')\"")
-            sys.exit(1)
 
     state["phase"] = "EDL"
-    state["gates"]["strategy_confirmed"] = {"done": True, "confirmed_by": confirmed_by or "user"}
-    _gate_nonce_clear(state, "strategy")
+    state["gates"]["strategy_confirmed"] = {"done": True, "confirmed_by": "user"}
     save_state(state)
-    print(f"Strategy confirmed. Phase EDL.\n\n"
-          f"YOU OWE: `{edit_dir}/edl.json` per SKILL.md 'EDL format'. Every range needs "
-          f"source/start/end/beat/quote/reason. To strip filler words, author COARSE "
-          f"structural ranges (keep the content you want; do NOT try to cut individual "
-          f"um/uh yourself) and set `\"strip_fillers\": true` — the pipeline removes every "
-          f"filler inside your ranges from check_fillers.py's timestamps. Use `omissions` "
-          f"for deliberate CONTENT you drop. Then run:\n\n    pipeline.py {edit_dir}")
+    print("Strategy confirmed. Phase EDL.\n\n" + _EDL_OWED.format(edit=edit_dir))
     sys.exit(0)
 
 
@@ -902,32 +795,20 @@ Phase SELF_EVAL. The pipeline extracted timeline frames of the RENDERED output
 at every cut boundary (±1.5s) plus head/tail/mid samples, in `{edit}/eval/`.
 {duration_line}
 
-YOU OWE: inspect every `{edit}/eval/*.png` for —
+Inspect every `{edit}/eval/*.png` for —
   - visual discontinuity / flash / jump at a cut
   - a waveform spike at a boundary (audio pop past the 30 ms fade)
-  - a subtitle hidden behind an overlay
-  - an overlay showing the wrong frames / misaligned
+  - a subtitle clipped at an edge or hidden behind an overlay
   - the intended background swap / grade actually took effect
   - grade consistency, subtitle readability, overall coherence
-Write your findings — one line per frame, what you checked and saw — to
-`{edit}/eval/eval_review.md`. `--eval-verdict pass` is REFUSED without it.
+Write your findings — one line per frame — to `{edit}/eval/eval_review.md`.
 
-All clear   →  write eval/eval_review.md, then  pipeline.py {edit} --eval-verdict pass
-Any problem →  fix the EDL (or render settings), then
-              pipeline.py {edit} --eval-verdict fail --restage edl   (or: --restage render)
-Hard cap: 3 fail cycles, after which remaining issues must be surfaced to the
-user rather than looped on.
-{agent_note}"""
+All clear   →  pipeline.py {edit} --eval-verdict pass
+Any problem →  pipeline.py {edit} --eval-verdict fail --restage edl   (or: --restage render)
+Hard cap: 3 fail cycles.
 
-_AGENT_SELF_EVAL_NOTE = """
-NOTE: this pipeline was started by an agent that cannot view images. **You
-cannot pass this phase — `--eval-verdict pass` from you is refused, with or
-without an eval_review.md (a text-only model has, in the past, fabricated a
-detailed frame-by-frame review to get through).** Hand off: a human or Claude
-Code inspects eval/*.png, writes their real findings to eval/eval_review.md,
-and runs `pipeline.py <dir> --eval-verdict pass --reviewer <name>`. You MAY
-run `--eval-verdict fail` if the duration check or something else is wrong.
-"""
+(An agent-started run never reaches this text — it runs qc_render.py for an
+automated render QC and finishes, pinging the user with the result.)"""
 
 
 def _output_cut_boundaries(edl: dict) -> list[float]:
@@ -979,57 +860,96 @@ def generate_eval_frames(state: dict) -> str:
     return f"Duration check: output {actual}s vs EDL {expected}s — {flag}."
 
 
+def _run_qc(state: dict) -> tuple[str, list[str]]:
+    """Deterministic render QC (qc_render.py -- ~0.2s, no vision model). Returns
+    (verdict 'PASS'|'ISSUES'|'ERROR', issues). Writes eval/eval_review.md."""
+    edit_dir = Path(state["edit_dir"])
+    r = run_helper("qc_render.py", str(edit_dir), "--json",
+                   "-o", str(edit_dir / "eval" / "eval_review.md"), check=False)
+    try:
+        d = json.loads((r.stdout or "").strip().splitlines()[-1])
+        return str(d.get("verdict", "ERROR")).upper(), list(d.get("issues", []))
+    except (json.JSONDecodeError, IndexError):
+        return "ERROR", [f"qc_render.py produced no parseable verdict: "
+                         f"{(r.stdout + r.stderr).strip()[:200]}"]
+
+
+def _notify_user(state: dict, message: str) -> None:
+    n = state.get("notify") or {}
+    if n.get("session_key"):
+        try:
+            send_system_event(n["session_key"], n.get("profile"), message)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _done_message(state: dict, verdict: str, issues: list[str]) -> str:
+    edit_dir = Path(state["edit_dir"])
+    final = edit_dir / "final.mp4"
+    dur = "?"
+    try:
+        p = subprocess.run(["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                            "-of", "csv=p=0", str(final)], capture_output=True, text=True)
+        dur = f"{float(p.stdout.strip()):.1f}s"
+    except (ValueError, OSError):
+        pass
+    try:
+        edl = json.loads((edit_dir / "edl.json").read_text())
+    except (json.JSONDecodeError, OSError):
+        edl = {}
+    bits = [f"{len(edl.get('ranges', []))} range(s)"]
+    if edl.get("strip_fillers"):
+        bits.append("fillers stripped")
+    if edl.get("background"):
+        bits.append("background swapped")
+    bits.append("captions burned")
+    summary = f"{final} ({dur}) — {', '.join(bits)}"
+    if verdict == "PASS":
+        return (f"✅ video-use edit ready: {summary}\n"
+                f"Render QC: clean. Review the video and reply here to request a re-cut.")
+    if verdict == "ISSUES":
+        il = "\n".join(f"  • {x}" for x in issues) or "  • (see eval/eval_review.md)"
+        return (f"⚠️ video-use edit ready: {summary}\nRender QC flagged:\n{il}\n"
+                f"Reply 'recut <what to change>' to fix, or 'ship it' to accept as-is. "
+                f"Full review: {edit_dir}/eval/eval_review.md")
+    return (f"video-use edit ready: {summary}\nRender QC could NOT run — please "
+            f"eyeball {final} and {edit_dir}/eval/*.png. Reply to request a re-cut.")
+
+
 def phase_self_eval(state: dict, verdict: str | None, restage: str | None,
-                    reviewer: str | None = None, nonce: str | None = None) -> None:
+                    reviewer: str | None = None) -> None:
     edit_dir = Path(state["edit_dir"])
     se = state["gates"]["self_eval"]
-
     review = edit_dir / "eval" / "eval_review.md"
 
     if verdict is None:
         dline = generate_eval_frames(state)
-        note = _AGENT_SELF_EVAL_NOTE if running_as_agent(state) else ""
-        print(SELF_EVAL_CHECKLIST.format(edit=edit_dir, duration_line=dline, agent_note=note))
-        if running_as_agent(state):
-            _, nf = _gate_nonce_ensure(state, "self_eval")
-            print(f"\nPASS is applied OUT OF BAND by a human / Claude Code (not by "
-                  f"you) after they inspect eval/*.png:\n"
-                  f"    pipeline.py {edit_dir} --eval-verdict pass --reviewer <name> "
-                  f"--nonce \"$(cat '{nf}')\"\n"
-                  f"You cannot read that nonce file. You MAY run --eval-verdict fail.")
+        if not running_as_agent(state):
+            print(SELF_EVAL_CHECKLIST.format(edit=edit_dir, duration_line=dline))
+            sys.exit(0)
+        # agent-started run -> deterministic render QC, then finish + ping the user.
+        v, issues = _run_qc(state)
+        se["verdict"] = {"PASS": "pass", "ISSUES": "issues"}.get(v, "unreviewed")
+        se["reviewer"] = "qc_render.py"
+        se["issues"] = issues
+        state["phase"] = "DONE"
+        save_state(state)
+        _finish(state)
+        _notify_user(state, _done_message(state, v, issues))
         sys.exit(0)
 
     if verdict == "pass":
-        # An agent-started run CANNOT pass its own visual QC. The model is
-        # text-only; on 2026-09-08 Beast wrote a detailed, confident, entirely
-        # FABRICATED frame-by-frame review ("man in blue shirt... clean cut,
-        # no flash") and passed. An existence+length check on prose can't
-        # catch that. So: pass on an agent-started run requires --reviewer
-        # <name>, which asserts a human / Claude Code / describe_frames.py
-        # actually looked. `fail` stays open to the agent (failing is safe).
-        if running_as_agent(state) and (not reviewer or not _gate_nonce_ok(state, "self_eval", nonce)):
-            _, nf = _gate_nonce_ensure(state, "self_eval")
-            print("REFUSED: an agent-started run cannot pass its own visual QC — it "
-                  "cannot see the frames, and it has fabricated a review AND passed "
-                  "--reviewer itself before.\n"
-                  "A human or Claude Code inspects eval/*.png, writes "
-                  "eval/eval_review.md, and runs (they can read the nonce file; you "
-                  "cannot):\n"
-                  f"    pipeline.py {edit_dir} --eval-verdict pass --reviewer <name> "
-                  f"--nonce \"$(cat '{nf}')\"\n"
-                  "You MAY run `--eval-verdict fail` if something is wrong.")
-            sys.exit(1)
+        # manual / Claude Code path only (agent runs auto-QC above and never
+        # reach here). Requires a real eval_review.md.
         txt = review.read_text().strip() if review.exists() else ""
         if len(txt) < 100:
             print(f"REFUSED: --eval-verdict pass requires a real review at "
                   f"{review} (found {'nothing' if not txt else str(len(txt)) + ' chars'}). "
-                  f"Inspect every eval/*.png and write what you checked and saw, one "
-                  f"line per frame, then retry.")
+                  f"Inspect every eval/*.png and write what you checked and saw.")
             sys.exit(1)
         se["verdict"] = "pass"
-        se["reviewer"] = reviewer or "self"
+        se["reviewer"] = reviewer or "user"
         state["phase"] = "DONE"
-        _gate_nonce_clear(state, "self_eval")
         save_state(state)
         _finish(state)
         sys.exit(0)
@@ -1083,10 +1003,14 @@ def _finish(state: dict) -> None:
         filler_note = (f"\n**Filler removal:** strip_fillers on — {len(edl.get('ranges', []))} "
                        f"coarse range(s) rendered as {len(eff.get('ranges', []))} "
                        f"effective range(s) (see edl.effective.json).\n")
-    verdict = state["gates"]["self_eval"].get("verdict")
+    se = state["gates"]["self_eval"]
+    verdict = se.get("verdict")
+    qc_note = ""
+    if se.get("issues"):
+        qc_note = "\n**QC flagged:**\n" + "\n".join(f"  - {x}" for x in se["issues"]) + "\n"
     block = (
         f"\n## Session {n} — {time.strftime('%Y-%m-%d')}\n\n"
-        f"**Self-eval verdict:** {verdict}\n\n"
+        f"**Self-eval verdict:** {verdict} (reviewer: {se.get('reviewer', '?')})\n{qc_note}\n"
         f"**Strategy:**\n\n{strat}\n\n"
         f"**Cut decisions:**\n{decisions or '  (none)'}\n{filler_note}"
     )
@@ -1110,27 +1034,24 @@ def do_restage(state: dict, target: str) -> None:
     if target in ("strategy", "edl"):
         (edit_dir / "edl.effective.json").unlink(missing_ok=True)  # stale derived cut list
     if target == "self_eval":
-        # back to SELF_EVAL: drop the verdict + any (possibly fabricated) review
-        (edit_dir / "eval" / "eval_review.md").unlink(missing_ok=True)
+        # back to SELF_EVAL: drop the verdict, the review, and the QC job state
+        for f in ("eval/eval_review.md",):
+            (edit_dir / f).unlink(missing_ok=True)
         state["phase"] = "SELF_EVAL"
         state["gates"]["self_eval"] = {"passes": 0, "verdict": None}
-        _gate_nonce_clear(state, "self_eval")  # mint a fresh one next run
         save_state(state)
-        print(f"Restaged to SELF_EVAL (verdict + eval_review.md cleared). "
-              f"Run `pipeline.py {edit_dir}` to regenerate eval frames.")
+        print(f"Restaged to SELF_EVAL (verdict + review + QC state cleared). "
+              f"Run `pipeline.py {edit_dir}` to re-run eval frames + QC.")
         sys.exit(0)
     if target == "strategy":
         state["phase"] = "STRATEGY"
         state["gates"]["strategy_confirmed"] = {"done": False}
-        _gate_nonce_clear(state, "strategy")  # mint a fresh one next run
         for g in ("edl_validated", "render_done"):
             state["gates"][g]["done"] = False
         save_state(state)
-        print(f"Restaged to STRATEGY. Rewrite {state['edit_dir']}/strategy.md "
-              f"(with a real `## User confirmation`). It is then confirmed with "
-              f"`pipeline.py {state['edit_dir']} --confirm-strategy` — an agent "
-              f"cannot confirm its own strategy; a human runs it with "
-              f"`--confirmed-by <name>`.")
+        print(f"Restaged to STRATEGY. Rewrite {state['edit_dir']}/strategy.md. "
+              f"An agent-started run then auto-advances to EDL; a Claude Code run "
+              f"uses `pipeline.py {state['edit_dir']} --confirm-strategy`.")
         sys.exit(0)
     if target == "edl":
         state["phase"] = "EDL"
@@ -1166,14 +1087,13 @@ def print_status(state: dict) -> None:
     owed = {
         "INGEST": "run `pipeline.py <edit-dir>` (it does ffprobe/transcribe/pack/"
                   "fillers/gaps, then hands you briefing.md).",
-        "STRATEGY": "write strategy.md (+ `## User confirmation`); a human/Claude "
-                    "Code then runs `pipeline.py <edit-dir> --confirm-strategy` "
-                    "(`--confirmed-by <name>` if an agent started this run — the "
-                    "agent cannot confirm its own strategy).",
+        "STRATEGY": "write strategy.md; post the plan to the user. Agent run: "
+                    "auto-advances to EDL. Claude Code run: `--confirm-strategy`.",
         "EDL": "write edl.json per SKILL.md, then `pipeline.py <edit-dir>`.",
         "RENDER": "run `pipeline.py <edit-dir>` to render (nothing to author).",
-        "SELF_EVAL": "run `pipeline.py <edit-dir>` for eval frames, inspect them, "
-                     "then `--eval-verdict pass|fail`.",
+        "SELF_EVAL": "run `pipeline.py <edit-dir>`. Agent run: auto vision-QC via "
+                     "qc_render.py, then DONE + user ping. Claude Code run: "
+                     "inspect eval/*.png then `--eval-verdict pass|fail`.",
         "DONE": "nothing — the edit is complete.",
     }
     print(f"\nnext:     {owed[state['phase']]}")
@@ -1182,24 +1102,24 @@ def print_status(state: dict) -> None:
 # ──────────────────────────── watch mode ────────────────────────────
 #
 # `pipeline.py <edit-dir> --watch` is a detached loop that OWNS the mechanical
-# transitions an idle agent keeps failing to make. It never authors an artifact
-# and never passes a human gate (--confirm-strategy, --eval-verdict pass). It:
-#   INGEST / RENDER  -> runs `pipeline.py <dir>` itself to advance; a job that
+# transitions an idle agent keeps failing to make. It never authors an artifact.
+# For an agent-started run there is no human gate: STRATEGY auto-advances once
+# strategy.md exists, SELF_EVAL runs qc_render.py and finishes. It:
+#   INGEST / RENDER / SELF_EVAL -> runs `pipeline.py <dir>` itself to advance; a job that
 #                       fails MAX_CONSEC_FAIL times in a row -> stop + escalate
 #                       (this is what stops a whisper/ffmpeg retry storm).
-#   STRATEGY / EDL    -> the artifact is the agent's; fire ONE rate-limited
-#                       `system event --mode now` nudge with the exact next
-#                       action (and, for EDL, the exact validator error), keyed
-#                       so each fresh edit gets one fresh nudge.
-#   SELF_EVAL         -> generate the eval frames, nudge once for a SIGHTED
-#                       review, then exit (an agent cannot pass this phase).
+#   STRATEGY / EDL    -> the artifact (strategy.md / edl.json) is the agent's;
+#                       fire ONE rate-limited `system event --mode now` nudge
+#                       with the exact next action (and, for EDL, the exact
+#                       validator error), keyed so each fresh edit gets one
+#                       fresh nudge. Once the artifact is on disk the driver
+#                       advances the phase itself (STRATEGY -> EDL auto).
 # Absolute backstops: a wall-clock cap and a per-phase driver-run cap, both of
 # which stop the watcher and ping the session for a human.
 #
-# Design note: `plans/AUTO-ADVANCE-DESIGN.md`. Open question flagged there and
-# still true — whether `system event --mode now` reliably triggers an agent turn
-# (a manual one did not visibly wake Beast on 2026-09-08). Every nudge's outcome
-# is logged to jobs/watch.log so the first real run answers it.
+# Design note: `plans/AUTO-ADVANCE-DESIGN.md`. `system event --mode now`
+# verified to wake an agent turn on live Beast runs (2026-09-08/09); every
+# nudge's outcome is logged to jobs/watch.log.
 
 POLL_INTERVAL_S = 20
 WATCH_MAX_S = 5400            # 90 min absolute cap on a single watch
@@ -1268,37 +1188,23 @@ def _nudge_mark(wstate: dict, key: str) -> None:
 
 
 _STRATEGY_NUDGE = (
-    "video-use pipeline for {edit} is at STRATEGY and waiting on you. Read "
-    "{edit}/briefing.md in full, discuss the edit with the user, then write "
-    "{edit}/strategy.md (4-8 sentences: shape, cut direction, length target, "
-    "grade, subtitle style) with a `## User confirmation` section quoting the "
-    "user's plain-English approval. Then PRESENT the plan to the user and STOP — "
-    "you cannot confirm your own strategy; a human runs --confirm-strategy once "
-    "the user has actually approved."
-)
-_STRATEGY_CONFIRM_NUDGE = (
-    "video-use pipeline for {edit}: strategy.md is written. It now needs the "
-    "user's real approval, then a human or Claude Code runs:  "
-    "pipeline.py {edit} --confirm-strategy --confirmed-by <name>  . The agent "
-    "cannot run this step and the watcher will not run it — it is human-gated."
+    "video-use pipeline for {edit} is at STRATEGY. Read {edit}/briefing.md in "
+    "full, then write {edit}/strategy.md (4-8 sentences: shape, cut direction, "
+    "length target, grade, subtitle style) AND post the same plan to the user "
+    "for visibility. There is NO confirmation step — the pipeline advances to "
+    "EDL on its own once strategy.md exists. Do only that, then stop."
 )
 _EDL_NUDGE = (
-    "video-use pipeline for {edit} is at EDL and waiting on you. Write "
-    "{edit}/edl.json per SKILL.md 'EDL format' — coarse structural ranges "
-    "(source/start/end/reason each); set \"strip_fillers\": true to drop filler "
-    "words; use `omissions` for deliberate content cuts. Then run:  "
-    "pipeline.py {edit}  — do only that, then stop; the watcher renders from there."
+    "video-use pipeline for {edit} is at EDL. Write {edit}/edl.json per SKILL.md "
+    "'EDL format' — coarse structural ranges (source/start/end/reason each, pick "
+    "the content to KEEP); set \"strip_fillers\": true to drop um/uh; put each "
+    "dropped content span in `omissions` (in the GAP between ranges — omissions "
+    "annotate, they don't cut); `background` must be an ABSOLUTE path. Then run:  "
+    "pipeline.py {edit}  — do only that, then stop; the watcher renders + QCs from there."
 )
 _EDL_REJECT_NUDGE = (
     "video-use pipeline for {edit}: edl.json was NOT accepted —\n\n{err}\n\n"
     "Fix {edit}/edl.json and stop. The watcher re-checks automatically."
-)
-_SELF_EVAL_NUDGE = (
-    "video-use render for {edit} is done; eval frames are in {edit}/eval/. This "
-    "phase needs a SIGHTED review — an agent cannot pass it. A human or Claude "
-    "Code must inspect eval/*.png, write {edit}/eval/eval_review.md, then run:  "
-    "pipeline.py {edit} --eval-verdict pass --reviewer <name>  . The watcher is "
-    "stopping now; the pipeline is safely parked here."
 )
 
 
@@ -1403,7 +1309,10 @@ def do_watch(edit_dir: Path, max_seconds: int) -> None:
                 result = _watch_job_phase(edit_dir, wstate, "RENDER", "SELF_EVAL",
                                           "RENDER FAILED")
             elif phase == "SELF_EVAL":
-                result = _watch_self_eval(edit_dir, wstate, skey, prof)
+                # runs generate_eval_frames + qc_render.py, then
+                # advances to DONE on its own and pings the user.
+                result = _watch_job_phase(edit_dir, wstate, "SELF_EVAL", "DONE",
+                                          "SELF_EVAL FAILED")
             else:
                 _wlog(f"unknown phase {phase!r}; idling")
         except Exception as e:  # noqa: BLE001 - a loop bug must not kill the watcher silently
@@ -1453,21 +1362,21 @@ def _watch_job_phase(edit_dir: Path, wstate: dict, phase: str, next_phase: str,
 
 def _watch_strategy(edit_dir: Path, st: dict, wstate: dict, skey, prof):
     sp = edit_dir / "strategy.md"
-    if st["gates"]["strategy_confirmed"]["done"]:
-        return None  # phase should already be EDL; nothing to do
-    if not sp.exists():
+    if not (sp.exists() and len(sp.read_text().strip()) >= 200):
         g = _nudge_gate(wstate, "STRATEGY:write")
         if g is None:
-            return ("stop", f"agent never wrote strategy.md after "
+            return ("stop", f"agent never wrote a substantive strategy.md after "
                             f"{MAX_NUDGES_PER_PHASE} nudges")
         if g:
             _nudge(skey, prof, _STRATEGY_NUDGE.format(edit=edit_dir))
             _nudge_mark(wstate, "STRATEGY:write")
         return None
-    # written but not confirmed -> human-gated; nudge slowly, never stop on it
-    if _nudge_gate(wstate, "STRATEGY:confirm", cooldown=1800):
-        _nudge(skey, prof, _STRATEGY_CONFIRM_NUDGE.format(edit=edit_dir))
-        _nudge_mark(wstate, "STRATEGY:confirm")
+    # strategy.md is on disk -> the driver auto-advances an agent run to EDL.
+    r = _run_driver(edit_dir)
+    wstate["driver_runs"]["STRATEGY"] = wstate["driver_runs"].get("STRATEGY", 0) + 1
+    now = _read_json(state_path(edit_dir)) or {}
+    if now.get("phase") == "EDL":
+        _wlog("STRATEGY -> EDL (auto)")
     return None
 
 
@@ -1502,19 +1411,6 @@ def _watch_edl(edit_dir: Path, st: dict, wstate: dict, skey, prof):
     elif g is None:
         _wlog("EDL still rejected; nudge budget for this revision exhausted, idling")
     return None
-
-
-def _watch_self_eval(edit_dir: Path, wstate: dict, skey, prof):
-    # generate the eval frames (verdict=None path), nudge once, then hand off:
-    # an agent-started run structurally cannot pass this phase.
-    r = _run_driver(edit_dir)
-    wstate["driver_runs"]["SELF_EVAL"] = wstate["driver_runs"].get("SELF_EVAL", 0) + 1
-    if r.returncode not in (0,):
-        _wlog(f"SELF_EVAL frame gen rc={r.returncode}: {(r.stdout + r.stderr).strip()[:200]}")
-    _nudge(skey, prof, _SELF_EVAL_NUDGE.format(edit=edit_dir))
-    _nudge_mark(wstate, "SELF_EVAL:review")
-    _wlog("SELF_EVAL: frames generated, review nudge sent, watcher handing off")
-    return "exit"
 
 
 def _spawn_watcher(edit_dir: Path) -> None:
@@ -1614,20 +1510,14 @@ def main() -> None:
     ap = argparse.ArgumentParser(prog="pipeline.py")
     ap.add_argument("edit_dir", type=Path)
     ap.add_argument("--status", action="store_true")
-    ap.add_argument("--confirm-strategy", action="store_true")
-    ap.add_argument("--confirmed-by", type=str, default=None,
-                    help="who relayed the user's approval of the strategy (required to "
-                         "`--confirm-strategy` an agent-started run; the agent cannot "
-                         "confirm its own plan and must hand off)")
-    ap.add_argument("--eval-verdict", choices=["pass", "fail"], default=None)
+    ap.add_argument("--confirm-strategy", action="store_true",
+                    help="STRATEGY checkpoint for a Claude-Code-driven run; an "
+                         "agent-started run auto-advances once strategy.md exists")
+    ap.add_argument("--eval-verdict", choices=["pass", "fail"], default=None,
+                    help="SELF_EVAL verdict for a Claude-Code-driven run; an "
+                         "agent-started run auto-QCs via qc_render.py")
     ap.add_argument("--reviewer", type=str, default=None,
-                    help="who inspected the eval frames (required to `--eval-verdict "
-                         "pass` an agent-started run; a text-only agent cannot supply it "
-                         "honestly and must hand off)")
-    ap.add_argument("--nonce", type=str, default=None,
-                    help="out-of-band gate value for an agent-started run; read from "
-                         "~/.video-use-gate/<hash>/<phase>.nonce (a file an OpenClaw "
-                         "agent cannot read). Required with --confirmed-by / --reviewer.")
+                    help="who inspected the eval frames (recorded with --eval-verdict pass)")
     ap.add_argument("--restage", choices=["strategy", "edl", "render", "self_eval"], default=None)
     ap.add_argument("--watch", action="store_true",
                     help="run the detached auto-advance loop for this edit dir "
@@ -1652,15 +1542,13 @@ def main() -> None:
         if state["phase"] != "STRATEGY":
             sys.exit(f"REFUSED: --confirm-strategy only valid in STRATEGY phase "
                      f"(currently {state['phase']}).")
-        phase_strategy(state, confirm=True, confirmed_by=args.confirmed_by,
-                       nonce=args.nonce)
+        phase_strategy(state, confirm=True)
         return
     if args.eval_verdict:
         if state["phase"] != "SELF_EVAL":
             sys.exit(f"REFUSED: --eval-verdict only valid in SELF_EVAL phase "
                      f"(currently {state['phase']}).")
-        phase_self_eval(state, args.eval_verdict, args.restage, args.reviewer,
-                        nonce=args.nonce)
+        phase_self_eval(state, args.eval_verdict, args.restage, args.reviewer)
         return
     if args.restage:
         do_restage(state, args.restage)

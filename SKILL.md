@@ -120,24 +120,25 @@ finished; run `pipeline.py <edit-dir>` again. (2026-09-08: a woken agent read th
 raw transcript and posted "~15 uhs" instead of advancing — `check_fillers.py` never ran.)
 
 **Auto-advance watcher.** When `init` is run with `--notify-session` (i.e. by
-Jensen/Beast), a detached watcher starts and drives the mechanical phases for you:
-it runs `pipeline.py <edit-dir>` itself through INGEST and RENDER, and at STRATEGY,
-EDL, and SELF_EVAL it sends you a `system event` nudge naming the one artifact it
-needs. **When a nudge names a next action, do exactly that one thing, then stop** —
-write the file it asks for and run the command it gives, nothing more. The watcher
-re-checks on its own; you don't need to "keep going". It never writes your
-artifacts and never passes a human gate (`--confirm-strategy`, `--eval-verdict
-pass`). If it hits a retry storm, an unresponsive stretch, or its time cap it stops
-and pings the session — at that point a human is needed. Log: `<edit>/jobs/watch.log`.
+Jensen/Beast), a detached watcher starts and drives every mechanical phase: it
+runs `pipeline.py <edit-dir>` itself through INGEST, RENDER and SELF_EVAL (which
+auto-QCs via `qc_render.py`), and at STRATEGY and EDL it sends one
+`system event` nudge naming the artifact it needs (`strategy.md`, `edl.json`).
+**When a nudge names a next action, do exactly that one thing, then stop** — write
+the file, nothing more. Once the file is on disk the pipeline advances on its own;
+you don't confirm anything and you don't review the render. The run goes to DONE
+and the user is pinged with the result. If the watcher hits a retry storm, an
+unresponsive stretch, or its time cap it stops and pings the session.
+Log: `<edit>/jobs/watch.log`.
 
 | Command | Phase | The driver does (no choice for you) | You owe back |
 |---|---|---|---|
 | `pipeline.py init <video>… [--notify-session K --notify-profile P]` | — | create `<video_parent>/edit/` + state; prints the path (don't pass `--edit-dir`) | — |
 | `pipeline.py <dir>` | INGEST | ffprobe → `transcribe.py --verbatim` → `pack_transcripts.py` → `check_fillers.py` → silence-gap table → **`briefing.md`** + 2 sample frames | read `briefing.md`, converse with the user |
-| `pipeline.py <dir> --confirm-strategy` | STRATEGY | check `strategy.md` exists, is substantive, has a `## User confirmation` quote; **from an agent-started run also requires `--confirmed-by <name>` AND `--nonce <value>` (from a file the agent can't read)** | write `strategy.md` (4–8 sentences + the confirmation section); if an agent, present the plan and **stop** — you can't confirm your own strategy |
+| `pipeline.py <dir> --confirm-strategy` | STRATEGY | checks `strategy.md` exists + is substantive. **Manual (Claude-Code-driven) runs only** — an agent-started run auto-advances to EDL the moment `strategy.md` is on disk (no confirmation step; the user reviews the finished video, not the plan). | write `strategy.md` (4–8 sentences) |
 | `pipeline.py <dir>` | EDL | schema-check `edl.json`; `render.py --validate-only` (cut-vs-speech); if `strip_fillers` → expand coarse ranges into `edl.effective.json`; refuse on any failure, no `--force` | write `edl.json` per **EDL format** — coarse ranges + `strip_fillers: true` for filler removal |
 | `pipeline.py <dir>` | RENDER | `render.py … --build-subtitles` | nothing — wait |
-| `pipeline.py <dir>` | SELF_EVAL | extract `timeline_view` frames of the **rendered output** at every cut (±1.5s) + head/tail/mids; check duration vs EDL | inspect every `eval/*.png` (see checklist), write findings to `eval/eval_review.md` (one line per frame — `--eval-verdict pass` is refused without it), then `--eval-verdict pass` or `--eval-verdict fail --restage edl\|render` (cap 3 fails) |
+| `pipeline.py <dir>` | SELF_EVAL | extract `timeline_view` frames of the **rendered output** at every cut (±1.5s) + head/tail/mids. **Agent-started run:** also runs `qc_render.py` (deterministic render QC: duration, mp4 integrity, background-swap log, captions), writes `eval/eval_review.md`, finishes the run, and pings the user with the result — no agent action. **Manual run:** prints the checklist for you. | manual only: inspect every `eval/*.png`, write `eval/eval_review.md`, then `--eval-verdict pass` or `--eval-verdict fail --restage edl\|render` (cap 3) |
 | `pipeline.py <dir> --eval-verdict pass` | → DONE | append the session block to `project.md` | — |
 
 `pipeline.py <dir> --status` prints the current phase and exactly what's owed.
@@ -156,18 +157,15 @@ driver owns correctness; you own taste.
 - the intended background swap / grade actually took effect (a matte can "succeed" and change nothing — verify visually)
 - grade consistency, subtitle readability, overall coherence (head/tail/mid frames)
 
-**Two gates an agent-started run cannot pass itself — STRATEGY confirm and SELF_EVAL pass.** For each, the pipeline writes a random nonce to `~/.video-use-gate/<hash>/<phase>.nonce` (a file outside the edit dir; an OpenClaw agent has no way to read it) and the confirm command needs `--nonce <value>` from that file plus `--confirmed-by`/`--reviewer <name>`:
+**Agent-started runs are fully unattended — init to DONE with no human gate.** The agent writes `strategy.md` (and posts the plan to the user for visibility) and `edl.json`; the pipeline does everything else. STRATEGY auto-advances the moment `strategy.md` exists. SELF_EVAL runs `qc_render.py` — a fast deterministic render QC (duration vs EDL, mp4 integrity, background-swap log line, caption sanity) — writes `eval/eval_review.md`, finishes the run, and pings the user: `✅ edit ready` (clean), `⚠️ edit ready` + flagged issues (reply `recut …` or `ship it`), or `edit ready` + "QC couldn't run, please eyeball" if the check itself failed. The **user reviews the finished video**, not the plan.
 
-- `pipeline.py <dir> --confirm-strategy --confirmed-by <name> --nonce "$(cat ~/.video-use-gate/<hash>/strategy.nonce)"`
-- `pipeline.py <dir> --eval-verdict pass --reviewer <name> --nonce "$(cat ~/.video-use-gate/<hash>/self_eval.nonce)"` (also needs a real `eval/eval_review.md`)
-
-An earlier version gated only on `--confirmed-by`/`--reviewer` being *present* — an agent just typed them (2026-09-08: an agent wrote `"Go ahead with this plan."` into `strategy.md`, passed `--confirmed-by mike` itself, and drove the whole pipeline; and separately fabricated a frame-by-frame review to pass SELF_EVAL). The nonce closes that: only a human or Claude Code can `cat` the file. `--eval-verdict fail` stays open to the agent. `pipeline.py <dir> --status` and the STRATEGY / SELF_EVAL output print the exact one-paste command with the `$(cat …)` filled in. A non-agent-started run (Claude Code drove `init`) needs no nonce.
+The `--confirm-strategy` and `--eval-verdict` commands still exist for **Claude-Code-driven** edits (where `running_as_agent` is false), as manual checkpoints. They do nothing for agent runs. (History: an earlier design gated these for agents behind `--confirmed-by`/`--reviewer` and then an out-of-band nonce; both were friction on the wrong party — an agent fabricated a `## User confirmation` quote, then typed `--confirmed-by mike` itself. Removing the human gate for agent runs entirely, and reviewing the output instead, is cleaner and matches "hand it a video from my phone and get an edit back".)
 
 ## If the pipeline refuses
 
 - **`WAITING: …`** — a background job (transcription or render) is still running.
   You'll be notified when it finishes; then re-run `pipeline.py <dir>`. Nothing is wrong.
-- **`REFUSED: … strategy.md …`** / **`REFUSED: an agent-started run cannot confirm its own strategy`** — write a real `strategy.md` with a `## User confirmation` section quoting the user's plain-English approval, then **if you are an agent: present the plan and stop.** You cannot run `--confirm-strategy` — a human / Claude Code confirms it with `--confirmed-by <name> --nonce "$(cat …)"` (the pipeline prints the exact line) after the user actually approves.
+- **`REFUSED: … strategy.md …`** — write a substantive `strategy.md` (≥200 chars). An agent-started run then auto-advances to EDL; a Claude-Code run runs `--confirm-strategy`.
 - **`EDL NOT ACCEPTED — it does not express the edit you intend`** — either an `omissions` entry sits inside your kept ranges (it cuts nothing — move a range boundary instead), or your ranges keep ≥95 % of the source and rely on `strip_fillers` (that's not an edit — select tight content ranges). The message says which.
 - **`EDL SCHEMA INVALID:`** — fix the listed structural problems in `edl.json`
   (missing fields, bad paths, start ≥ end, range past source duration).
@@ -177,10 +175,7 @@ An earlier version gated only on `--confirmed-by`/`--reviewer` being *present* �
   `render.py --force` — the pipeline doesn't use it and neither should you here.
 - **`INGEST FAILED: …`** — transcription failed or produced a non-verbatim file.
   Check `<edit>/jobs/*.log`.
-- **`REFUSED: --eval-verdict pass requires a real review …`** — inspect every
-  `eval/*.png` and write a per-frame assessment to `eval/eval_review.md` first. A
-  text-only agent can't do this; hand off to a human, Claude Code, or
-  `describe_frames.py`. `--eval-verdict fail` never needs the review.
+- **`REFUSED: --eval-verdict pass requires a real review …`** (Claude-Code runs only) — inspect every `eval/*.png` and write a per-frame assessment to `eval/eval_review.md` first. `--eval-verdict fail` never needs the review. Agent-started runs never see this — `qc_render.py` writes the review and sets the verdict automatically.
 
 ## Cut craft (techniques)
 
