@@ -109,15 +109,30 @@ both SOUL.md** — rewritten for the unattended model: agent writes `strategy.md
 
 ## 5. What to do next
 
-1. **First full LIVE agent run in unattended mode.** (Init-loop + whisper-orphan hardening now done, commit 09c5d42 — a failed step no longer lets Beast stack watchers.) Clear `test-beast/edit`.
-   Have Beast `init`, then write `strategy.md` (on the STRATEGY nudge) and
-   `edl.json` (on the EDL nudge) — nothing else. Confirm the run reaches DONE
-   and pings Mike's channel with the `qc_render` verdict, with **zero terminal
-   interaction**. Watch `<edit>/jobs/watch.log`.
-2. **Tune `qc_render.py`** from that run — the abrupt-end heuristic is the
-   weakest check (a soft "note", not an "issue"); adjust if noisy or missing
-   things.
-3. **Test a `recut` round-trip**: Mike replies "recut the ending" to the DONE
-   ping → Beast does `--restage edl`, rewrites `edl.json`, re-renders, re-QCs,
-   re-pings. Confirm that loop works agent-side.
-4. Scrap the stale `test-beast/edit` (2026-09-09-AM render) before the live test.
+**The unattended pipeline + recut round-trip both work now** (2026-09-09), but
+each live test hit bugs — all fixed:
+- init loop (agent re-ran `init` after a transcribe failure) → 150s guard +
+  live-watcher check + `_spawn_watcher` dedupe (`09c5d42`)
+- whisper pinned all 16 vCPUs, jetsam killed it at 98% → thread cap 8 +
+  process-group kill (`09c5d42`)
+- recut reused the stale `final.mp4` → `_invalidate_render()` + `phase_render`
+  staleness check + `qc_render` stale flag (`64af577`)
+- `--restage edl` loop → 90s guard (`2c5baf3`)
+- recut path had no watcher → `do_restage` re-spawns one for agent runs (`64af577`)
+
+Verified end to end: run #2 went init → DONE (`final.mp4` 55.8s, qc PASS,
+Discord ping), and the recut re-rendered cleanly (55.8s → 55.4s, the "for" cut
+took).
+
+1. **Watch the recut `final.mp4`** — confirm Beast dropped the *right* "for"
+   (output still has "FOR VIDEO" + "FOR GRAPHIC" captions; the cut was
+   source 7.42-7.84).
+2. **Another clean unattended run from scratch** with no interventions, to
+   confirm the guards hold and nothing else surfaces.
+3. **Beast behaviour**: it loops "re-run X" instructions and stalls after
+   saying it will act. Consider whether the recut/DONE ping wording can be
+   firmer ("run this ONCE"), and whether SKILL.md needs a "never re-run
+   --restage / init; run `pipeline.py <dir>`" line (the runtime REFUSED
+   messages now say it, but Beast looped anyway before the guards).
+4. `test-beast/edit` holds the recut render (55.38s). Scrap before the next
+   from-scratch test.

@@ -638,3 +638,34 @@ transcription completes with ~10 whisper threads (was ~13+), zero orphans.
 STILL: the unattended-mode pipeline has not run end-to-end live. Retry when the
 VM is idle (it was at load 1.7 afterward). The whisper throttle should keep a
 single transcription survivable now.
+
+## First recut round-trip — 3 bugs, all fixed (2026-09-09)
+
+Mike replied "recut and remove one of the duplicate 'for's at 6-8s" to the
+first unattended DONE ping. Beast: `--restage edl` → split range 1 into
+`0.66-7.42` + `7.84-22.04` with omission `7.42-7.84` for the "for" → advanced.
+The edit MECHANICS were right; three things went wrong:
+
+1. **Stale render reused.** `phase_render` ran `render.py --status`, which
+   reported DONE off the leftover `final.mp4` + the prior `render_final.json`
+   lock, so the re-cut EDL never rendered — the run "completed" with the
+   original video. Fix (`64af577`): `do_restage` calls `_invalidate_render()`
+   (deletes final.mp4/prenorm/lock/eval PNGs/review); `phase_render` also
+   force-re-renders if the EDL is newer than final.mp4; `qc_render.py` flags a
+   `final.mp4 older than the EDL` as an ISSUE.
+2. **`--restage edl` looped.** Beast ran it every ~60s (Mike's "re-run
+   pipeline.py <dir> --restage edl" taken as repeat-forever), each one wiping
+   the render + re-spawning the watcher, killing the in-flight re-render.
+   Load hit 9. Fix (`2c5baf3`): `do_restage` REFUSES if run <90s ago
+   (`<hash>.restage` marker), message points at `pipeline.py <dir>`.
+3. **No watcher on the recut path**, then Beast stalled. `do_restage` now
+   re-spawns the watcher for agent runs (`64af577`), but Claude Code had killed
+   all watchers stopping bug #2; Beast then said "let me push it through" and
+   did nothing. Claude Code manually started one watcher (process resumption,
+   not an artifact edit) → clean pass: EDL → real re-render → SELF_EVAL →
+   qc PASS → DONE. Result: `final.mp4` 55.81s → 55.38s, 91 → 90 caption cues —
+   the cut took.
+
+Behaviour pattern confirmed: Beast LOOPS a valid command when told "re-run X",
+and STALLS after announcing it will act. The watcher + the init/restage guards
+are what contain both.
