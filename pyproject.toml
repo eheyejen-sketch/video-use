@@ -10,6 +10,8 @@ dependencies = [
     "matplotlib",
     "pillow",
     "numpy",
+    "faster-whisper>=1.2,<2",
+    "onnxruntime>=1.16,<1.21",
 ]
 
 [project.optional-dependencies]

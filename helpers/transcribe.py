@@ -1,26 +1,54 @@
 #!/Users/mikeattreys/Developer/video-use/.venv/bin/python3
-"""Transcribe a video with local Whisper (openai-whisper) — free, fully offline.
+"""Transcribe a video with faster-whisper (CTranslate2) — free, fully offline.
 
 Drop-in replacement for the original ElevenLabs Scribe-based transcribe.py
-(kept alongside as transcribe_scribe.py.bak). Extracts mono 16kHz audio via
-ffmpeg, runs the local `whisper` CLI with word-level timestamps, and reshapes
-the output into the same {"words": [...]} schema pack_transcripts.py expects
-(type/text/start/end/speaker_id).
+(kept alongside as transcribe_scribe.py.bak) and, since 2026-09-10, for the
+openai-whisper CLI path that preceded this. Extracts mono 16kHz audio via
+ffmpeg, runs faster-whisper in-process with word-level timestamps, and
+reshapes the output into the same {"words": [...]} schema pack_transcripts.py
+expects (type/text/start/end/speaker_id).
 
-Known gaps vs. Scribe (openai-whisper doesn't do either):
+Why faster-whisper over the openai-whisper CLI (swapped 2026-09-10):
+  - ~3x faster on CPU (no PyTorch; CTranslate2 int8).
+  - In-process — no subprocess, no orphaned torch workers to reap, no
+    per-core process fan-out. Thread count is bounded by `cpu_threads`.
+  - Transcribes more of hard/fast segments the openai-whisper turbo path
+    silently dropped.
+
+Verbatim mode (`--verbatim`) uses config "D1", validated 2026-09-10 against a
+2:51 clip through check_fillers.py:
+  - `hotwords=VERBATIM_PROMPT` — faster-whisper re-injects hotwords into every
+    decode window, so the "include filler words" bias persists past the first
+    30s. (`initial_prompt` only seeds window 1 and, worse, loops into
+    "uh uh uh" in trailing silence — do not use it here.)
+  - `condition_on_previous_text=False` — removes the rolling-context feedback
+    loop that otherwise runs away into hundreds of consecutive "uh" on a hard
+    segment when combined with any reset-suppression.
+  Tradeoff accepted: D1 collapses legitimate short "uh, uh" stutter-repeats to
+  a single "uh" (harmless for a filler-removal cut) and does not recover as
+  much speech on hard segments as config "D3" would. D3 was rejected because
+  its word timestamps collapse to zero-duration on exactly those segments; see
+  memory `project_video_use_setup` if revisiting.
+
+MPS/Metal is not an option: CTranslate2 has no Metal backend at all (same
+CPU-only outcome as the openai-whisper float64/DTW crash, different cause).
+Do not re-spike it.
+
+Known gaps (unchanged from the openai-whisper path):
   - No speaker diarization — every word is tagged with a single constant
     speaker_id. Fine for solo-narrated content; a real limitation for
     multi-speaker interviews.
-  - No audio-event tagging (laughter, applause, sighs) — those entries are
-    simply absent, not approximated.
+  - No audio-event tagging (laughter, applause, sighs).
 
-Cached: if the output file already exists, transcription is skipped.
+Cached: if the output file already exists (and matches the requested verbatim
+mode), transcription is skipped.
 
 Usage:
     python helpers/transcribe.py <video_path>
     python helpers/transcribe.py <video_path> --edit-dir /custom/edit
     python helpers/transcribe.py <video_path> --language en
     python helpers/transcribe.py <video_path> --model turbo
+    python helpers/transcribe.py <video_path> --verbatim
 """
 
 from __future__ import annotations
@@ -28,35 +56,52 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _job_lock  # noqa: E402
 
-WHISPER_BIN = "whisper"
-DEFAULT_MODEL = "turbo"
-DEFAULT_DEVICE = "cpu"  # MPS is broken for word-level timestamps in this openai-whisper
+DEFAULT_MODEL = "turbo"        # CLI-facing name; mapped to a faster-whisper repo below
+DEFAULT_DEVICE = "cpu"         # CTranslate2 has no Metal backend — CPU is the only option
+DEFAULT_COMPUTE_TYPE = "int8"  # fastest, and no less accurate than float32 on this audio
 
-# On the 16-vCPU VM, an unthrottled whisper (turbo + word_timestamps) spins up a
-# worker per core and drives load to ~13 on its own -- a transient memory spike
-# near the alignment step then gets a worker SIGKILL'd (jetsam is flaky in the
-# VM), and the whole job dies at ~98% with a "leaked semaphore" trace. Capping
-# the thread pools keeps the load and the memory footprint in a range the box
-# survives, at ~1.5x wall time. Override with VIDEO_USE_WHISPER_THREADS.
-WHISPER_THREADS = os.environ.get("VIDEO_USE_WHISPER_THREADS", "8")
-                        # version: the DTW alignment step casts to float64, which Apple's
-                        # Metal backend doesn't support at all. Confirmed by direct test
-                        # (2026-07-27) — not a flag fix, CPU is the only working option.
-                        # "turbo" model on CPU still runs well faster than realtime on M2.
+# faster-whisper wants a HuggingFace repo id / known alias. Accept the
+# openai-whisper size names the pipeline and callers already pass.
+_FW_MODEL_MAP = {
+    "turbo": "large-v3-turbo",
+    "large-v3-turbo": "large-v3-turbo",
+    "large-v3": "large-v3",
+    "large-v2": "large-v2",
+    "large": "large-v3",
+    "medium": "medium",
+    "small": "small",
+    "base": "base",
+    "tiny": "tiny",
+}
+
+# faster-whisper runs in this process. On the 16-vCPU VM an unbounded CPU
+# transcription drives load high enough that the flaky guest jetsam SIGKILLs a
+# worker mid-run; capping the CTranslate2 thread pool keeps it in a range the
+# box survives, at ~1.5x wall time. Override with VIDEO_USE_WHISPER_THREADS.
+WHISPER_THREADS = int(os.environ.get("VIDEO_USE_WHISPER_THREADS", "8"))
+
+# WhisperModel is not safe for concurrent transcribe() calls, and 4 of them
+# (transcribe_batch.py's default pool) each spawning WHISPER_THREADS threads
+# would oversubscribe the box badly. Load the model once and serialize
+# transcription; batch workers then queue, which is optimal anyway for
+# CPU-bound single-machine inference.
+_MODEL_CACHE: dict[str, object] = {}
+_MODEL_LOAD_LOCK = threading.Lock()
+_TRANSCRIBE_LOCK = threading.Lock()
 
 
 def load_api_key() -> str:
-    """No API key needed for local Whisper. Kept only because
+    """No API key needed for local faster-whisper. Kept only because
     transcribe_batch.py imports this name directly."""
     return "local"
 
@@ -70,73 +115,76 @@ def extract_audio(video_path: Path, dest: Path) -> None:
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-# Whisper normalizes out filler words ("um"/"uh") by default -- verified on a
-# real clip 2026-09-04 across both the turbo and large-v3 models. This exact
-# prompt, with --carry_initial_prompt so it applies to every internal decode
-# window (not just the first 30s), reliably surfaces them as real words with
-# timestamps instead. Only use --verbatim when a filler-removal pass is
-# actually wanted -- it changes nothing else about transcription quality/timing.
+# faster-whisper (like Whisper) normalizes out filler words ("um"/"uh") by
+# default. Passed as `hotwords` (NOT initial_prompt), this seed is re-applied to
+# every internal decode window, so fillers surface as real words with
+# timestamps for the whole clip, not just the first 30s.
 VERBATIM_PROMPT = (
     "Um, so, like, this is a verbatim transcript that includes every um, uh, "
     "and filler word exactly as spoken, uh, without cleaning anything up."
 )
 
 
+def _get_model(model: str):
+    """Lazily load and cache a faster-whisper WhisperModel for `model`."""
+    repo = _FW_MODEL_MAP.get(model, model)
+    with _MODEL_LOAD_LOCK:
+        cached = _MODEL_CACHE.get(repo)
+        if cached is None:
+            from faster_whisper import WhisperModel  # local import: heavy, optional at import time
+
+            cached = WhisperModel(
+                repo,
+                device=DEFAULT_DEVICE,
+                compute_type=DEFAULT_COMPUTE_TYPE,
+                cpu_threads=WHISPER_THREADS,
+            )
+            _MODEL_CACHE[repo] = cached
+        return cached
+
+
 def call_whisper(
     audio_path: Path,
-    out_dir: Path,
+    out_dir: Path,  # unused (in-process now); kept for signature compatibility
     language: str | None = None,
     model: str = DEFAULT_MODEL,
     verbatim: bool = False,
 ) -> dict:
-    cmd = [
-        WHISPER_BIN, str(audio_path),
-        "--model", model,
-        "--device", DEFAULT_DEVICE,
-        "--word_timestamps", "True",
-        "--output_format", "json",
-        "--output_dir", str(out_dir),
-        "--verbose", "False",
-    ]
-    if language:
-        cmd += ["--language", language]
-    if verbatim:
-        cmd += ["--initial_prompt", VERBATIM_PROMPT, "--carry_initial_prompt", "True"]
+    """Transcribe `audio_path` with faster-whisper. Returns an
+    openai-whisper-shaped payload -- {"language": str,
+    "segments": [{"words": [{"word", "start", "end"}, ...]}, ...]} -- so
+    to_scribe_schema() and its callers are unchanged."""
+    fw_model = _get_model(model)
 
-    env = {
-        **os.environ,
-        "OMP_NUM_THREADS": WHISPER_THREADS,
-        "MKL_NUM_THREADS": WHISPER_THREADS,
-        "OPENBLAS_NUM_THREADS": WHISPER_THREADS,
-        "NUMEXPR_NUM_THREADS": WHISPER_THREADS,
-        "VECLIB_MAXIMUM_THREADS": WHISPER_THREADS,
-        "PYTORCH_NUM_THREADS": WHISPER_THREADS,
+    kwargs: dict = {
+        "word_timestamps": True,
+        "vad_filter": False,
+        "beam_size": 5,
+        "language": language,  # None -> auto-detect on the first window
+        # config D1 -- see module docstring. `condition_on_previous_text=False`
+        # is on BOTH paths: it removes the rolling-context feedback that
+        # otherwise runs away into a repetition loop in trailing/near-silence
+        # (verified 2026-09-10: the default True setting looped "...something
+        # that I made based on..." 55x into the last 1.3s of a clip).
+        "condition_on_previous_text": False,
     }
-    # start_new_session so the whole whisper process group can be killed as one --
-    # otherwise, if this transcribe.py is killed (retry storm, gateway restart),
-    # whisper's torch worker keeps running detached and pins ~12 cores (seen
-    # 2026-09-09: an orphan at 1233% CPU for minutes after its parent died).
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, env=env, start_new_session=True)
-    try:
-        _out, err = proc.communicate()
-    except BaseException:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            proc.kill()
-        raise
-    if proc.returncode != 0:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)  # reap any stragglers
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-        raise RuntimeError(f"whisper failed: {(err or '')[-2000:]}")
+    if verbatim:
+        kwargs["hotwords"] = VERBATIM_PROMPT
 
-    raw_path = out_dir / f"{audio_path.stem}.json"
-    payload = json.loads(raw_path.read_text())
-    raw_path.unlink(missing_ok=True)
-    return payload
+    with _TRANSCRIBE_LOCK:
+        segments, info = fw_model.transcribe(str(audio_path), **kwargs)
+        # `segments` is a generator -- iterating it runs the transcription.
+        seg_list = [
+            {
+                "words": [
+                    {"word": w.word, "start": w.start, "end": w.end}
+                    for w in (seg.words or [])
+                ]
+            }
+            for seg in segments
+        ]
+
+    return {"language": info.language, "segments": seg_list}
 
 
 def to_scribe_schema(whisper_payload: dict) -> dict:
@@ -171,7 +219,7 @@ def transcribe_one(
     model: str = DEFAULT_MODEL,
     verbatim: bool = False,
 ) -> Path:
-    """Transcribe a single video with local Whisper. Returns path to transcript JSON.
+    """Transcribe a single video with local faster-whisper. Returns path to transcript JSON.
 
     Cached: returns existing path immediately if it exists AND was produced with
     the same `verbatim` mode being requested now (checked via a `"verbatim"` field
@@ -179,7 +227,7 @@ def transcribe_one(
     pack_transcripts.py's `*.json` glob never sees a duplicate for the same video.
     Switching modes re-transcribes and overwrites.
 
-    `verbatim=True` primes Whisper to include filler words ("um"/"uh") that it
+    `verbatim=True` primes the model to include filler words ("um"/"uh") that it
     otherwise normalizes out by default -- use when a filler-removal cut is
     actually wanted.
     """
@@ -208,7 +256,7 @@ def transcribe_one(
         size_mb = audio.stat().st_size / (1024 * 1024)
         if verbose:
             mode = " [verbatim]" if verbatim else ""
-            print(f"  transcribing {video.stem}.wav ({size_mb:.1f} MB) with local whisper ({model}){mode}", flush=True)
+            print(f"  transcribing {video.stem}.wav ({size_mb:.1f} MB) with faster-whisper ({model}){mode}", flush=True)
         raw = call_whisper(audio, tmp_path, language, model, verbatim)
         payload = to_scribe_schema(raw)
         payload["verbatim"] = verbatim
@@ -229,7 +277,7 @@ def _job_key(video: Path, verbatim: bool) -> str:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Transcribe a video with local Whisper (free, offline)")
+    ap = argparse.ArgumentParser(description="Transcribe a video with local faster-whisper (free, offline)")
     ap.add_argument("video", type=Path, help="Path to video file")
     ap.add_argument(
         "--edit-dir",
@@ -247,18 +295,18 @@ def main() -> None:
         "--num-speakers",
         type=int,
         default=None,
-        help="Unused (no diarization with local Whisper); kept for CLI compatibility.",
+        help="Unused (no diarization with local faster-whisper); kept for CLI compatibility.",
     )
     ap.add_argument(
         "--model",
         type=str,
         default=DEFAULT_MODEL,
-        help="Whisper model size (default: turbo)",
+        help="Model size (default: turbo -> faster-whisper large-v3-turbo)",
     )
     ap.add_argument(
         "--verbatim",
         action="store_true",
-        help="Prime Whisper to include filler words (um/uh) it otherwise normalizes out. "
+        help="Prime the model to include filler words (um/uh) it otherwise normalizes out. "
              "Use before a filler-removal cut. Re-transcribes if the cached file used a different mode.",
     )
     ap.add_argument(
@@ -324,10 +372,10 @@ def main() -> None:
 
     # Foreground entry point. Fast in every case: either the transcript is
     # already cached (returns immediately), a job for it is already running
-    # (reports status, does not launch a duplicate whisper process), or a
-    # new background worker is spawned and this call returns right away --
-    # never blocks on the actual transcription, regardless of how it's
-    # invoked (Bash, OpenClaw's exec, or a plain shell script).
+    # (reports status, does not launch a duplicate worker), or a new background
+    # worker is spawned and this call returns right away -- never blocks on the
+    # actual transcription, regardless of how it's invoked (Bash, OpenClaw's
+    # exec, or a plain shell script).
     if cached_output.exists():
         try:
             cached = json.loads(cached_output.read_text())
