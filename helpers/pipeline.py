@@ -95,7 +95,14 @@ except ImportError:  # pragma: no cover - _job_lock is a sibling; this is belt-a
         return False
 
 STATE_NAME = "pipeline_state.json"
-PHASES = ["INGEST", "STRATEGY", "EDL", "RENDER", "SELF_EVAL", "DONE"]
+PHASES = ["INGEST", "STRATEGY", "EDL", "STYLE_SAMPLE", "RENDER", "SELF_EVAL", "DONE"]
+
+# A kept range is sampled for the STYLE_SAMPLE gate only if its duration falls
+# in this window -- long enough to judge a grade/overlay choice, short enough
+# to render fast as a proof-of-style check, not a second full render.
+STYLE_SAMPLE_MIN_S = 15.0
+STYLE_SAMPLE_MAX_S = 45.0
+STYLE_SAMPLE_TARGET_S = 30.0
 
 
 # an inter-word gap at least this long is reported in the gap table
@@ -113,6 +120,7 @@ def _fresh_gates() -> dict:
         "ingest_briefing": {"done": False, "artifact": "briefing.md"},
         "strategy_confirmed": {"done": False},
         "edl_validated": {"done": False},
+        "style_sample": {"done": False, "approved": False, "path": None},
         "render_done": {"done": False, "output": None},
         "self_eval": {"passes": 0, "verdict": None},
     }
@@ -735,11 +743,188 @@ def phase_edl(state: dict) -> None:
                   f"gap. Fix edl.json and re-run `pipeline.py {edit_dir}`.")
             sys.exit(1)
 
-    state["phase"] = "RENDER"
+    state["phase"] = "STYLE_SAMPLE"
     state["gates"]["edl_validated"]["done"] = True
     save_state(state)
-    print(f"EDL validated (schema + cut check). Phase RENDER.\n"
-          f"Run `pipeline.py {edit_dir}` again to start the render.")
+    print(f"EDL validated (schema + cut check). Phase STYLE_SAMPLE.\n"
+          f"Run `pipeline.py {edit_dir}` again to continue.")
+    sys.exit(0)
+
+
+# ──────────────────────── phase: STYLE_SAMPLE ─────────────────────────
+#
+# Added 2026-10-19, borrowed from a creator's published workflow ("AI with
+# Kyle" -- make a 30s styled sample, get it approved, THEN style the whole
+# video). Our gap was real: EDL validation went straight to a full RENDER
+# with no cheap proof step, so a bad grade/overlay choice cost a full render
+# to discover. This phase is a no-op pass-through unless the EDL actually
+# requests a grade or an overlay -- captions alone (pipeline.py always
+# passes --build-subtitles) don't count as "styling" here, or this gate
+# would fire on every single edit and just become a third rubber-stamp.
+#
+# Deliberately NOT inserted into the agent-unattended path: Mike's 2026-09-09
+# decision removed every mid-run human gate for Jensen/Beast runs on purpose
+# ("review the finished video, not the plan") after real friction with
+# fakeable confirmation gates. Re-adding one here for agent runs would
+# relitigate that call for no reason -- an agent-started run always skips
+# straight through. This is a Claude-Code-driven (manual) checkpoint only,
+# same family as --confirm-strategy / --eval-verdict.
+
+def _edl_is_stylable(edl: dict) -> bool:
+    grade = edl.get("grade")
+    has_grade = bool(grade) and grade not in ("none", "")
+    return has_grade or bool(edl.get("overlays"))
+
+
+def _build_style_sample_edl(edl: dict, edit_dir: Path) -> dict | None:
+    """Pick the single kept range closest to STYLE_SAMPLE_TARGET_S seconds
+    (preferring the MIN..MAX window) and build a one-range EDL that carries
+    the same grade/background, plus any overlay whose output window falls
+    entirely inside that range's position in the full output timeline
+    (re-based to the sample's own local time). Returns None if no range in
+    the EDL is usable (e.g. every kept range is a few seconds long)."""
+    ranges = edl.get("ranges") or []
+    if not ranges:
+        return None
+
+    cum = 0.0
+    candidates = []
+    for r in ranges:
+        try:
+            dur = float(r["end"]) - float(r["start"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        candidates.append((r, cum, dur))
+        cum += dur
+    if not candidates:
+        return None
+
+    def _score(item):
+        _r, _off, dur = item
+        if STYLE_SAMPLE_MIN_S <= dur <= STYLE_SAMPLE_MAX_S:
+            return abs(dur - STYLE_SAMPLE_TARGET_S)
+        return 1000.0 + abs(dur - STYLE_SAMPLE_TARGET_S)
+
+    r, out_start, dur = min(candidates, key=_score)
+    out_end = out_start + dur
+
+    sample: dict = {
+        "version": edl.get("version", 1),
+        "sources": {r["source"]: edl["sources"][r["source"]]},
+        "ranges": [dict(r)],
+        "grade": edl.get("grade"),
+    }
+    if edl.get("background"):
+        sample["background"] = edl["background"]
+
+    sample_overlays = []
+    for ov in edl.get("overlays") or []:
+        try:
+            ov_s = float(ov["start_in_output"])
+            ov_e = ov_s + float(ov["duration"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if ov_s >= out_start - 0.01 and ov_e <= out_end + 0.01:
+            shifted = dict(ov)
+            shifted["start_in_output"] = round(ov_s - out_start, 3)
+            sample_overlays.append(shifted)
+    if sample_overlays:
+        sample["overlays"] = sample_overlays
+    return sample
+
+
+def phase_style_sample(state: dict, approve: bool) -> None:
+    edit_dir = Path(state["edit_dir"])
+    gate = state["gates"].setdefault(
+        "style_sample", {"done": False, "approved": False, "path": None}
+    )
+    edl_full = json.loads((edit_dir / "edl.json").read_text())
+
+    if running_as_agent(state):
+        # No mid-run human gate for agent runs, ever -- see the comment block
+        # above. Skip straight through regardless of styling.
+        state["phase"] = "RENDER"
+        gate["done"] = True
+        gate["approved"] = "auto (agent run — no mid-run gate by design)"
+        save_state(state)
+        print("Agent-started run — style-sample gate skipped by design. Phase RENDER.")
+        sys.exit(0)
+
+    if approve:
+        sample_out = edit_dir / "style_sample.mp4"
+        if not (gate.get("done") and sample_out.exists()):
+            print(f"REFUSED: no rendered style sample at {sample_out} yet. Run "
+                  f"`pipeline.py {edit_dir}` first to generate it.")
+            sys.exit(1)
+        state["phase"] = "RENDER"
+        gate["approved"] = True
+        save_state(state)
+        print(f"Style sample approved. Phase RENDER.\n"
+              f"Run `pipeline.py {edit_dir}` to render the full edit.")
+        sys.exit(0)
+
+    if not _edl_is_stylable(edl_full):
+        state["phase"] = "RENDER"
+        gate["done"] = True
+        gate["approved"] = "n/a (no grade/overlay requested — captions alone don't trigger this gate)"
+        save_state(state)
+        print("No grade or overlay requested — skipping the style-sample gate. Phase RENDER.\n"
+              f"Run `pipeline.py {edit_dir}` to render the full edit.")
+        sys.exit(0)
+
+    sample_edl_path = edit_dir / "style_sample.edl.json"
+    sample_out = edit_dir / "style_sample.mp4"
+
+    if gate.get("done") and sample_out.exists() and not gate.get("approved"):
+        print(f"Phase STYLE_SAMPLE. Review {sample_out} — a {STYLE_SAMPLE_TARGET_S:.0f}s "
+              f"representative passage with the requested grade/overlay actually applied.\n\n"
+              f"Looks right  →  pipeline.py {edit_dir} --approve-style\n"
+              f"Needs a change →  edit edl.json's grade/overlay fields, then "
+              f"pipeline.py {edit_dir} --restage edl")
+        sys.exit(0)
+
+    sample_dict = _build_style_sample_edl(edl_full, edit_dir)
+    if sample_dict is None:
+        state["phase"] = "RENDER"
+        gate["done"] = True
+        gate["approved"] = "n/a (no single kept range long enough to sample)"
+        save_state(state)
+        print("No kept range is long enough to build a representative sample — "
+              f"skipping the style-sample gate. Phase RENDER.\n"
+              f"Run `pipeline.py {edit_dir}` to render the full edit.")
+        sys.exit(0)
+    sample_edl_path.write_text(json.dumps(sample_dict, indent=2))
+
+    common = [str(sample_edl_path), "-o", str(sample_out)]
+    st = run_helper("render.py", *common, "--status", check=False)
+    line = st.stdout.strip()
+    if line.startswith(("NOT_FOUND:", "FAILED:")) and not gate.get("done"):
+        # --force is justified ONLY here: the sample is a single range lifted
+        # out of an already-validated edl.json. Everything outside it is real
+        # speech that the FULL edit already declares removed in edl.json's own
+        # `omissions` -- the one-range sample just can't restate that against
+        # its own narrower transcript window. The real render (phase_render,
+        # below) still runs the full, un-forced validation against edl.json /
+        # edl.effective.json -- Hard Rule 6 is untouched for the actual output.
+        run_helper("render.py", *common, "--preview", "--build-subtitles", "--force", check=False)
+        st = run_helper("render.py", *common, "--status", check=False)
+        line = st.stdout.strip()
+
+    if line.startswith("DONE:"):
+        gate["done"] = True
+        gate["path"] = str(sample_out)
+        save_state(state)
+        print(f"Style sample rendered: {sample_out}\nReview it, then:\n"
+              f"  pipeline.py {edit_dir} --approve-style   (looks right — render the full edit)\n"
+              f"  pipeline.py {edit_dir} --restage edl     (needs a change — edit edl.json first)")
+        sys.exit(0)
+    if line.startswith("FAILED:"):
+        print(f"STYLE SAMPLE RENDER FAILED: {line}\n"
+              f"Inspect `{edit_dir}/jobs/*.log`. Re-run `pipeline.py {edit_dir}` to retry.")
+        sys.exit(1)
+
+    print(f"WAITING: style-sample render in progress ({line}). Re-run "
+          f"`pipeline.py {edit_dir}` once it's done (or you'll be notified).")
     sys.exit(0)
 
 
@@ -1045,12 +1230,33 @@ def phase_done(state: dict) -> None:
 
 # ───────────────────────────── restage ──────────────────────────────
 
-def _invalidate_render(edit_dir: Path) -> None:
+def _invalidate_render(edit_dir: Path, state: dict | None = None) -> None:
     """Drop the previous render output + its job lock + the eval artifacts, so a
     restage genuinely re-renders instead of `render.py --status` reporting DONE
-    off the stale final.mp4 (2026-09-09 recut bug)."""
+    off the stale final.mp4 (2026-09-09 recut bug).
+
+    2026-10-19: a restage is almost always "Mike reviewed this and asked for a
+    change" — the exact moment a creator's published workflow ("AI with
+    Kyle") keeps the previous preview under a version name instead of
+    overwriting it, so the before/after is comparable. Rather than add a
+    second canonical output (which would break every "the output is always
+    final.mp4" assumption elsewhere), archive the outgoing render into
+    `<edit>/exports/vN_<timestamp>.mp4` before clearing it. final.mp4 stays
+    the single current render; exports/ is the comparable history."""
     final = edit_dir / "final.mp4"
-    final.unlink(missing_ok=True)
+    if state is not None and final.exists():
+        exports = edit_dir / "exports"
+        exports.mkdir(parents=True, exist_ok=True)
+        v = state.get("version_counter", 1)
+        dest = exports / f"v{v}_{time.strftime('%Y%m%dT%H%M%S')}.mp4"
+        try:
+            final.rename(dest)
+            state["version_counter"] = v + 1
+            print(f"kept the previous render for comparison: {dest}")
+        except OSError:
+            final.unlink(missing_ok=True)
+    else:
+        final.unlink(missing_ok=True)
     (edit_dir / f"final.prenorm.mp4").unlink(missing_ok=True)
     (edit_dir / "jobs" / f"render_{final.stem}.json").unlink(missing_ok=True)
     (edit_dir / "eval" / "eval_review.md").unlink(missing_ok=True)
@@ -1085,8 +1291,14 @@ def do_restage(state: dict, target: str) -> None:
 
     if target in ("strategy", "edl"):
         (edit_dir / "edl.effective.json").unlink(missing_ok=True)  # stale derived cut list
+        # A style sample approved against the OLD edl.json (old grade/overlay)
+        # is stale once strategy or the EDL is being revised — force a fresh
+        # sample + re-approval rather than silently carrying the old verdict.
+        state["gates"]["style_sample"] = {"done": False, "approved": False, "path": None}
+        (edit_dir / "style_sample.edl.json").unlink(missing_ok=True)
+        (edit_dir / "style_sample.mp4").unlink(missing_ok=True)
     if target in ("strategy", "edl", "render"):
-        _invalidate_render(edit_dir)
+        _invalidate_render(edit_dir, state)
     if target == "self_eval":
         # back to SELF_EVAL: drop the verdict, the review, and the QC job state
         for f in ("eval/eval_review.md",):
@@ -1152,6 +1364,9 @@ def print_status(state: dict) -> None:
         "STRATEGY": "write strategy.md; post the plan to the user. Agent run: "
                     "auto-advances to EDL. Claude Code run: `--confirm-strategy`.",
         "EDL": "write edl.json per SKILL.md, then `pipeline.py <edit-dir>`.",
+        "STYLE_SAMPLE": "run `pipeline.py <edit-dir>`. Claude Code run with a grade/overlay "
+                        "requested: review the sample, then `--approve-style`. Everything "
+                        "else (no styling, or an agent run): auto-advances to RENDER.",
         "RENDER": "run `pipeline.py <edit-dir>` to render (nothing to author).",
         "SELF_EVAL": "run `pipeline.py <edit-dir>`. Agent run: auto vision-QC via "
                      "qc_render.py, then DONE + user ping. Claude Code run: "
@@ -1413,6 +1628,11 @@ def do_watch(edit_dir: Path, max_seconds: int) -> None:
                 result = _watch_strategy(edit_dir, st, wstate, skey, prof)
             elif phase == "EDL":
                 result = _watch_edl(edit_dir, st, wstate, skey, prof)
+            elif phase == "STYLE_SAMPLE":
+                # Agent runs always auto-pass this phase (no mid-run gate for
+                # them) -- one driver call is enough, there's never a job to wait on.
+                result = _watch_job_phase(edit_dir, wstate, "STYLE_SAMPLE", "RENDER",
+                                          "STYLE_SAMPLE FAILED")
             elif phase == "RENDER":
                 result = _watch_job_phase(edit_dir, wstate, "RENDER", "SELF_EVAL",
                                           "RENDER FAILED")
@@ -1614,6 +1834,7 @@ def do_init(argv: list[str]) -> None:
         "updated_at": time.time(),
         "notify": {"session_key": args.notify_session, "profile": args.notify_profile},
         "gates": _fresh_gates(),
+        "version_counter": 1,  # next exports/vN_*.mp4 archived on a restage (see _invalidate_render)
     }
     save_state(state)
     print(f"Pipeline initialized. Edit folder: {edit_dir}\n"
@@ -1629,6 +1850,7 @@ ADVANCE = {
     "INGEST": lambda st: phase_ingest(st),
     "STRATEGY": lambda st: phase_strategy(st, confirm=False),
     "EDL": lambda st: phase_edl(st),
+    "STYLE_SAMPLE": lambda st: phase_style_sample(st, approve=False),
     "RENDER": lambda st: phase_render(st),
     "SELF_EVAL": lambda st: phase_self_eval(st, None, None),
     "DONE": lambda st: phase_done(st),
@@ -1649,6 +1871,10 @@ def main() -> None:
     ap.add_argument("--confirm-strategy", action="store_true",
                     help="STRATEGY checkpoint for a Claude-Code-driven run; an "
                          "agent-started run auto-advances once strategy.md exists")
+    ap.add_argument("--approve-style", action="store_true",
+                    help="STYLE_SAMPLE checkpoint for a Claude-Code-driven run with a "
+                         "grade/overlay requested; an agent-started run (or an EDL with "
+                         "no styling) skips this phase entirely")
     ap.add_argument("--eval-verdict", choices=["pass", "fail"], default=None,
                     help="SELF_EVAL verdict for a Claude-Code-driven run; an "
                          "agent-started run auto-QCs via qc_render.py")
@@ -1679,6 +1905,12 @@ def main() -> None:
             sys.exit(f"REFUSED: --confirm-strategy only valid in STRATEGY phase "
                      f"(currently {state['phase']}).")
         phase_strategy(state, confirm=True)
+        return
+    if args.approve_style:
+        if state["phase"] != "STYLE_SAMPLE":
+            sys.exit(f"REFUSED: --approve-style only valid in STYLE_SAMPLE phase "
+                     f"(currently {state['phase']}).")
+        phase_style_sample(state, approve=True)
         return
     if args.eval_verdict:
         if state["phase"] != "SELF_EVAL":

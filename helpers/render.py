@@ -3,7 +3,7 @@
 
 Implements the HEURISTICS render pipeline in the correct order:
 
-  1. Per-segment extract with color grade + 30ms audio fades baked in
+  1. Per-segment extract with color grade + noise reduction + 30ms audio fades baked in
   2. Lossless -c copy concat into base.mp4
   2.5. If EDL has "background": replace the background behind the person
      (RVM matting, no green screen needed) — becomes the new base
@@ -232,6 +232,7 @@ def extract_segment(
     out_path: Path,
     preview: bool = False,
     draft: bool = False,
+    denoise: bool = True,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
@@ -262,7 +263,17 @@ def extract_segment(
 
     # 30ms audio fades at both edges (Rule 3) — prevent pops
     fade_out_start = max(0.0, duration - 0.03)
-    af = f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_start:.3f}:d=0.03"
+    af_parts = []
+    if denoise:
+        # Light, source-agnostic noise reduction. Mike records on a phone or
+        # laptop mic, not an isolated interface, so room hiss/hum is the
+        # normal case, not the exception. afftdn's default profile (no manual
+        # noise-print step) is deliberately conservative -- nf=-25 trims
+        # broadband hiss without the "underwater" artifact that aggressive
+        # settings produce on a voice track. Runs before the fades.
+        af_parts.append("afftdn=nf=-25")
+    af_parts.append(f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_start:.3f}:d=0.03")
+    af = ",".join(af_parts)
 
     if draft:
         preset, crf = "ultrafast", "28"
@@ -470,6 +481,7 @@ def extract_all_segments(
     edit_dir: Path,
     preview: bool,
     draft: bool = False,
+    denoise: bool = True,
 ) -> list[Path]:
     """Extract every EDL range into edit_dir/clips_graded/seg_NN.mp4.
     Returns the ordered list of segment paths.
@@ -509,7 +521,8 @@ def extract_all_segments(
         print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
-        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft)
+        extract_segment(src_path, start, duration, seg_filter, out_path,
+                        preview=preview, draft=draft, denoise=denoise)
         seg_paths.append(out_path)
 
     return seg_paths
@@ -920,6 +933,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Skip audio loudness normalization. Default is on (-14 LUFS, -1 dBTP, LRA 11).",
     )
     ap.add_argument(
+        "--no-denoise",
+        action="store_true",
+        help="Skip per-segment noise reduction (afftdn). Default is on -- phone/laptop "
+             "mic recordings carry more room noise than an isolated interface.",
+    )
+    ap.add_argument(
         "--force",
         action="store_true",
         help="Render even if cut validation finds a range that clips a word or "
@@ -976,7 +995,7 @@ def _run_render(args: argparse.Namespace, edl_path: Path, edit_dir: Path, out_pa
 
     # 1. Extract per-segment (auto-grade per range if EDL grade is "auto")
     segment_paths = extract_all_segments(
-        edl, edit_dir, preview=args.preview, draft=args.draft
+        edl, edit_dir, preview=args.preview, draft=args.draft, denoise=not args.no_denoise
     )
 
     # 2. Concat → base
@@ -1149,6 +1168,8 @@ def main() -> None:
         worker_argv.append("--no-matte")
     if args.no_loudnorm:
         worker_argv.append("--no-loudnorm")
+    if args.no_denoise:
+        worker_argv.append("--no-denoise")
     if args.force:
         worker_argv.append("--force")
     if args.notify_session:
