@@ -43,6 +43,7 @@ The skill lives in `video-use/`. User footage lives wherever they put it. All se
 ```
 <videos_dir>/
 ├── <source files, untouched>
+├── brief.md                 ← this video's audience/topic/outcome (optional — see "Brand-level folders" below)
 └── edit/
     ├── project.md               ← memory; appended every session
     ├── takes_packed.md          ← phrase-level transcripts, the LLM's primary reading view
@@ -53,9 +54,27 @@ The skill lives in `video-use/`. User footage lives wherever they put it. All se
     ├── master.srt               ← output-timeline subtitles
     ├── downloads/               ← yt-dlp outputs
     ├── verify/                  ← debug frames / timeline PNGs
+    ├── style_sample.mp4         ← STYLE_SAMPLE phase artifact, see below
+    ├── exports/vN_*.mp4         ← archived prior renders from a correction, see below
     ├── preview.mp4
     └── final.mp4
 ```
+
+**Brand-level folders (added 2026-10-19).** When `<videos_dir>` is nested one level under a parent folder that itself contains `style-guide.md`, `brief-template.md`, and/or `brand/`, treat that parent as the standing brand home — read it before asking the user to re-state anything it already answers:
+
+```
+<project-root>/
+└── <brand>/                     ← e.g. beachcrewzr/, emikeboudreau/, ai-and-education/
+    ├── brand/                   ← real logo/font/color assets for this brand
+    ├── style-guide.md           ← persistent editorial preferences, reused across every video for this brand — never rebuilt per-video (see "Learning style from reference clips")
+    ├── brief-template.md        ← stable brief fields (audience, target length, format) pre-filled; copy into a new video folder as brief.md, fill in the per-video fields (topic, outcome, source)
+    └── <video-name>/            ← one real <videos_dir>, same shape as above
+        ├── <source files>
+        ├── brief.md              ← copied from ../brief-template.md, per-video fields filled in
+        └── edit/
+```
+
+If no brand-level parent exists (a one-off video with no brand folder), everything above is optional — proceed exactly as before, nothing here is required.
 
 ## Setup
 
@@ -263,7 +282,7 @@ Return the final EDL and a one-line total runtime check.
 
 ## Learning style from reference clips (when requested)
 
-Added 2026-10-19, adapted from a creator's published workflow ("AI with Kyle"). Use this when the user hands you 2-3 clips they like (their own prior work, or someone else's) instead of (or alongside) describing a style in words. The goal is a persistent `<videos_dir>/style-guide.md` — a sibling of `edit/`, not inside it, so it survives across every edit in that project folder, unlike `strategy.md`/`project.md` which are per-edit.
+Added 2026-10-19, adapted from a creator's published workflow ("AI with Kyle"). Use this when the user hands you 2-3 clips they like (their own prior work, or someone else's) instead of (or alongside) describing a style in words. The goal is a persistent `style-guide.md`, a sibling of `edit/`, not inside it, so it survives across every edit — unlike `strategy.md`/`project.md`, which are per-edit. **If `<videos_dir>` sits under a brand-level parent folder (see "Directory layout" → "Brand-level folders"), write/update `style-guide.md` THERE, not inside this one video's own folder** — the whole point is that the next video for the same brand reuses it instead of re-deriving style from scratch. Only fall back to a `<videos_dir>/style-guide.md` of its own when there's no brand folder (a genuine one-off, unaffiliated video).
 
 1. **Inspect each reference, picture and sound, separately.** Picture: pull 3-5 `timeline_view.py` frames spread across the clip. Sound: a quick `transcribe.py` pass gives you pacing (words/sec, pause lengths) and caption-worthy phrasing; you cannot literally listen to audio, so ask the user directly about anything audio-only you can't infer from the transcript (music, tone, sound effects).
 2. **Describe what you actually observed** — pacing, framing, caption chunking/placement, when a graphic appears relative to the words being said — before proposing anything. If a referenced file won't open or a timestamp doesn't exist, say so by name; don't guess.
@@ -271,7 +290,7 @@ Added 2026-10-19, adapted from a creator's published workflow ("AI with Kyle"). 
 4. **Write `style-guide.md`** with every major choice linked to a `reference filename + timestamp` it came from, and clearly separate "observed in the reference" from "my proposed choice based on it." Use real brand assets (logo/fonts/colors) if the user has them, not placeholders.
 5. **Show the style guide before applying it.** Don't touch the actual edit until the user has confirmed it — same gate as strategy confirmation, just for style instead of cut structure.
 
-Once approved, `style-guide.md` is a standing reference for every future edit in this project folder — read it (alongside `project.md`) before proposing a strategy on a new recording, the same way you'd read `project.md`'s last session summary.
+Once approved, `style-guide.md` is a standing reference for every future edit under that brand — read it (alongside the video's own `project.md`) before proposing a strategy on a new recording, the same way you'd read `project.md`'s last session summary. Same logic applies to `brief-template.md`: if one exists at the brand level, copy it into the new video's folder as `brief.md` and fill in only the per-video fields (topic, outcome, source recording) — don't re-ask the user for audience/length/format if the template already answers them.
 
 ## Color grade (when requested)
 
