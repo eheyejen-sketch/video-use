@@ -145,6 +145,22 @@ Tell the user, in one short message:
 - That a good first message is: *"edit these into a launch video"* or *"inventory these takes and propose a strategy."*
 - That all outputs land in `<videos_dir>/edit/` — the repo stays clean.
 
+## Recording footage (optional — OBS)
+
+Not an install step; nothing here is required for a user who just points a phone at themselves and drops the file into a footage folder. Only cover this if the user asks about recording setup, not transcoding/editing.
+
+OBS Studio (free, open source, https://obsproject.com) is worth suggesting specifically for screen/tool-demo content, where a phone recording of a screen is a poor substitute for an actual screen capture. The reason it needs no changes on the `video-use` side: OBS composites every source — webcam, screen/window capture, a separate microphone — in its own Scenes/Sources editor *at record time*, so what it exports is a single flat video file, indistinguishable from a phone recording as far as `pipeline.py` is concerned. There is no multi-track ingestion to build here.
+
+If the user wants a quick OBS scene for talking-head-over-screen content:
+
+1. Add a **Display Capture** (or **Window Capture** for one app) source as the base layer.
+2. Add a **Video Capture Device** source (the webcam) on top, resized/positioned as a corner picture-in-picture — OBS's own transform handles do this, no code needed.
+3. Add an **Audio Input Capture** source for the mic; OBS's own filter chain can apply noise suppression at record time if the user wants it, though `render.py` already applies `afftdn` + loudness normalization downstream by default — doing it twice is harmless but redundant, not required.
+4. **Settings → Output**: record to MKV, not MP4, if the session might run long or OBS might crash mid-record — MKV survives an interrupted write; remux to MP4 afterward (`ffmpeg -i in.mkv -c copy out.mp4`) before handing it to `video-use`, or just record straight to MP4 for a short clip.
+5. Export the finished recording into the project's `footage/` folder exactly like any other source file.
+
+Don't build or suggest anything beyond this — a live two-source OBS scene, exported as one file, is the whole integration. Composite-at-edit-time (true picture-in-picture inside the EDL from two separate, unsynced video files) is a real but separate capability this skill does not have today.
+
 ## Keeping the skill current
 
 - `cd ~/Developer/video-use && git pull --ff-only` pulls the latest code. The symlink auto-picks it up on the next run.

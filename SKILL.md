@@ -71,11 +71,13 @@ First-time install lives in `install.md` (clone, deps, ffmpeg, skill registratio
 
 Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this SKILL.md. Resolve their paths relative to the directory containing this file — the skill is typically symlinked at `~/.claude/skills/video-use/` or `~/.codex/skills/video-use/`.
 
+**Recording the source footage (optional, added 2026-10-19).** Nothing here changes the default: a single phone or laptop-camera recording dropped into a folder and handed to `pipeline.py` works exactly as before. OBS Studio is worth mentioning as an alternative capture tool *only* because of how it exports, not because it changes anything downstream: OBS composites multiple live sources (webcam, screen/window capture, separate mic) in its own scene editor at record time, so what it exports is still ONE flat video file — you receive and edit it exactly like a phone video, no new EDL concept, no pipeline change. It's worth suggesting over a phone recording specifically for tool/screen-demo content (Kyle's "demonstrating a tool → screen capture + cursor" treatment, above) where a phone video of a screen is a bad substitute for an actual screen capture. See `install.md` for setup notes if the user wants it.
+
 ## Helpers
 
 **In a normal edit you drive everything through `pipeline.py` (see "The process" below) — it calls the helpers below in the enforced order. The reference here is for one-off debugging and for understanding what the driver does.**
 
-- **`pipeline.py init <video>…`** then **`pipeline.py <edit-dir>`** — the process driver. `init` creates the edit folder **next to the source video** (`<video_parent>/edit/`) and prints its path; **do not pass `--edit-dir`** — any value that isn't the canonical path is ignored. Use the printed path for every later call. Owns step order across `INGEST → STRATEGY → EDL → RENDER → SELF_EVAL → DONE`; runs `transcribe.py --verbatim` / `pack_transcripts.py` / `check_fillers.py` / the gap analysis / `render.py` for you and refuses to let you skip a step or render an unvalidated EDL. `--status` reports the phase; `--confirm-strategy`, `--eval-verdict pass|fail`, `--restage strategy|edl|render|self_eval` are the gates. Self-backgrounds; pass `--notify-session`/`--notify-profile` on `init` under OpenClaw.
+- **`pipeline.py init <video>…`** then **`pipeline.py <edit-dir>`** — the process driver. `init` creates the edit folder **next to the source video** (`<video_parent>/edit/`) and prints its path; **do not pass `--edit-dir`** — any value that isn't the canonical path is ignored. Use the printed path for every later call. Owns step order across `INGEST → STRATEGY → EDL → STYLE_SAMPLE → RENDER → SELF_EVAL → DONE`; runs `transcribe.py --verbatim` / `pack_transcripts.py` / `check_fillers.py` / the gap analysis / `render.py` for you and refuses to let you skip a step or render an unvalidated EDL. `--status` reports the phase; `--confirm-strategy`, `--approve-style`, `--eval-verdict pass|fail`, `--restage strategy|edl|render|self_eval` are the gates. Self-backgrounds; pass `--notify-session`/`--notify-profile` on `init` under OpenClaw.
 
 **`transcribe.py` and `render.py` self-background — you never need a background flag from the calling tool.** Every invocation returns almost immediately: the cache/lock is checked, a detached worker is spawned if needed, and the call exits. Poll with `--status` on the exact same command (same script, same args) until it prints `DONE:` or `FAILED:` — `RUNNING:` means keep waiting, `ALREADY_RUNNING:` means a prior call already started this exact job, don't launch another. This is deliberate and works identically in Claude Code's `Bash`, OpenClaw's `exec`, or a plain shell script — correctness does not depend on any caller-side background flag (confirmed 2026-09-07: relying on the calling tool's own flag was not reliable enough on its own — repeated blocking calls via OpenClaw's `exec` all died at the same ~2-minute mark before this fix). Calling either script again for the same job while it's still running is safe — it reports status instead of launching a duplicate whisper/ffmpeg process.
 
@@ -86,7 +88,9 @@ Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this
 - **`transcribe_batch.py <videos_dir>`** — 4-worker parallel transcription. Use for multi-take.
 - **`pack_transcripts.py --edit-dir <dir>`** — `transcripts/*.json` → `takes_packed.md` (phrase-level, break on silence ≥ 0.5s).
 - **`timeline_view.py <video> <start> <end>`** — filmstrip + waveform PNG. On-demand visual drill-down. **Not a scan tool** — use it at decision points, not constantly.
-- **`render.py <edl.json> -o <out>`** — validates every cut against the source's real transcript first (refuses to render and prints exactly what would be lost if a range clips a word or a gap contains real speech — see Hard Rule 6; `--force` overrides after you've actually reviewed why it fired), then per-segment extract → concat → background matte (if EDL has `"background"`) → overlays (PTS-shifted) → subtitles LAST. `--preview` for 720p fast. `--build-subtitles` to generate master.srt inline. `--no-matte` to skip background swap. Add `--status` (same `edl`/`-o` args) to poll a background render instead of starting one. **`--validate-only <edl.json>`** runs just the cut-vs-transcript check and exits 0/1 (no `-o` needed) — this is what `pipeline.py`'s EDL gate calls.
+- **`render.py <edl.json> -o <out>`** — validates every cut against the source's real transcript first (refuses to render and prints exactly what would be lost if a range clips a word or a gap contains real speech — see Hard Rule 6; `--force` overrides after you've actually reviewed why it fired), then per-segment extract (grade + **noise reduction** + 30ms audio fades) → concat → background matte (if EDL has `"background"`) → overlays (PTS-shifted) → subtitles LAST → loudness normalization. `--preview` for 720p fast. `--build-subtitles` to generate master.srt inline. `--no-matte` to skip background swap, `--no-loudnorm` to skip loudness normalization, `--no-denoise` to skip noise reduction (all default ON — see "Audio cleanup" below). Add `--status` (same `edl`/`-o` args) to poll a background render instead of starting one. **`--validate-only <edl.json>`** runs just the cut-vs-transcript check and exits 0/1 (no `-o` needed) — this is what `pipeline.py`'s EDL gate calls.
+
+**Audio cleanup (automatic, added 2026-10-19).** Every segment extraction runs `afftdn` (light noise reduction, `nf=-25`) before the fades, and the final composite runs two-pass `loudnorm` (-14 LUFS / -1 dBTP / LRA 11, the social-platform standard — this part already existed). Mike records on a phone or laptop mic, not an isolated interface, so room noise is the normal case. Both are safe defaults, not taste calls — don't turn either off unless a specific clip needs it (a very clean studio source where denoise does nothing, or Mike explicitly wants the room tone preserved).
 - **`grade.py <in> -o <out>`** — ffmpeg filter chain grade. Presets + `--filter '<raw>'` for custom. `warm_cinematic`/sky-boost style grades are rejected for this account, including Beachcrewzr — don't use, default to `none`.
 - **`matte.py <in> -o <out> --bg <image>`** — replace the background behind a person (RVM, no green screen). Own venv (`.matte-venv`). Invoked automatically by `render.py` when the EDL has `"background"` — you usually don't call this directly.
 - **`build_icon_overlay.py --icon <name> --label <text> --color R,G,B -o <out.mov>`** — build a single icon+label badge overlay (ProRes 4444, real alpha) from the local Tabler icon library (`~/Developer/tabler-icons`, MIT licensed, 6,000+ icons — see that repo's own README for the full catalog, or `--list-icons '<pattern>'` to search). Same visual style as the launch video's overlays. Use `rsvg-convert` for any other SVG rasterization — ImageMagick's built-in SVG delegate produces a 1-bit bitmap with no anti-aliasing, verified broken 2026-09-04.
@@ -101,7 +105,7 @@ yourself during a normal edit — the driver runs them, in order, and won't let 
 skip ahead.** (Call them directly only for one-off debugging.) It is a state machine:
 
 ```
-INGEST → STRATEGY → EDL → RENDER → SELF_EVAL → DONE
+INGEST → STRATEGY → EDL → STYLE_SAMPLE → RENDER → SELF_EVAL → DONE
 ```
 
 State lives in `<edit>/pipeline_state.json`. Every call is re-entrant and returns
@@ -121,9 +125,11 @@ raw transcript and posted "~15 uhs" instead of advancing — `check_fillers.py` 
 
 **Auto-advance watcher.** When `init` is run with `--notify-session` (i.e. by
 Jensen/Beast), a detached watcher starts and drives every mechanical phase: it
-runs `pipeline.py <edit-dir>` itself through INGEST, RENDER and SELF_EVAL (which
-auto-QCs via `qc_render.py`), and at STRATEGY and EDL it sends one
-`system event` nudge naming the artifact it needs (`strategy.md`, `edl.json`).
+runs `pipeline.py <edit-dir>` itself through INGEST, STYLE_SAMPLE, RENDER and
+SELF_EVAL (which auto-QCs via `qc_render.py`), and at STRATEGY and EDL it sends
+one `system event` nudge naming the artifact it needs (`strategy.md`,
+`edl.json`). STYLE_SAMPLE is a single pass-through driver call for an agent
+run — see "Style sample" below for why there's no agent gate there.
 **When a nudge names a next action, do exactly that one thing, then stop** — write
 the file, nothing more. Once the file is on disk the pipeline advances on its own;
 you don't confirm anything and you don't review the render. The run goes to DONE
@@ -137,12 +143,13 @@ Log: `<edit>/jobs/watch.log`.
 | `pipeline.py <dir>` | INGEST | ffprobe → `transcribe.py --verbatim` → `pack_transcripts.py` → `check_fillers.py` → silence-gap table → **`briefing.md`** + 2 sample frames | read `briefing.md`, converse with the user |
 | `pipeline.py <dir> --confirm-strategy` | STRATEGY | checks `strategy.md` exists + is substantive. **Manual (Claude-Code-driven) runs only** — an agent-started run auto-advances to EDL the moment `strategy.md` is on disk (no confirmation step; the user reviews the finished video, not the plan). | write `strategy.md` (4–8 sentences) |
 | `pipeline.py <dir>` | EDL | schema-check `edl.json`; `render.py --validate-only` (cut-vs-speech); if `strip_fillers` → expand coarse ranges into `edl.effective.json`; refuse on any failure, no `--force` | write `edl.json` per **EDL format** — coarse ranges + `strip_fillers: true` for filler removal |
+| `pipeline.py <dir> --approve-style` | STYLE_SAMPLE | if the EDL has no `grade`/`overlays` (captions alone don't count) → auto-advance, nothing to do. If it does: renders one ~30s representative range with the real grade/overlay applied to `style_sample.mp4`. **Manual (Claude-Code-driven) runs only** — an agent-started run always auto-advances, no gate (see "Style sample" below). | manual + stylable only: review `style_sample.mp4`, then `--approve-style`, or fix `edl.json`'s grade/overlay and `--restage edl` |
 | `pipeline.py <dir>` | RENDER | `render.py … --build-subtitles` | nothing — wait |
 | `pipeline.py <dir>` | SELF_EVAL | extract `timeline_view` frames of the **rendered output** at every cut (±1.5s) + head/tail/mids. **Agent-started run:** also runs `qc_render.py` (deterministic render QC: duration, mp4 integrity, background-swap log, captions), writes `eval/eval_review.md`, finishes the run, and pings the user with the result — no agent action. **Manual run:** prints the checklist for you. | manual only: inspect every `eval/*.png`, write `eval/eval_review.md`, then `--eval-verdict pass` or `--eval-verdict fail --restage edl\|render` (cap 3) |
 | `pipeline.py <dir> --eval-verdict pass` | → DONE | append the session block to `project.md` | — |
 
 `pipeline.py <dir> --status` prints the current phase and exactly what's owed.
-`pipeline.py <dir> --restage strategy\|edl\|render` steps back manually (`strategy` = rewrite strategy.md and re-confirm).
+`pipeline.py <dir> --restage strategy\|edl\|render` steps back manually (`strategy` = rewrite strategy.md and re-confirm). A restage to `strategy` or `edl` also resets the style-sample gate (a sample approved against the old EDL is stale once the EDL changes) and archives the outgoing `final.mp4` — see "Corrections keep history" below.
 
 **Your part is only the subjective work:** what the material is and what to ask the
 user (INGEST), the cut strategy (STRATEGY), the take/cut selection in the EDL and any
@@ -159,7 +166,22 @@ driver owns correctness; you own taste.
 
 **Agent-started runs are fully unattended — init to DONE with no human gate.** The agent writes `strategy.md` (and posts the plan to the user for visibility) and `edl.json`; the pipeline does everything else. STRATEGY auto-advances the moment `strategy.md` exists. SELF_EVAL runs `qc_render.py` — a fast deterministic render QC (duration vs EDL, mp4 integrity, background-swap log line, caption sanity) — writes `eval/eval_review.md`, finishes the run, and pings the user: `✅ edit ready` (clean), `⚠️ edit ready` + flagged issues (reply `recut …` or `ship it`), or `edit ready` + "QC couldn't run, please eyeball" if the check itself failed. The **user reviews the finished video**, not the plan.
 
-The `--confirm-strategy` and `--eval-verdict` commands still exist for **Claude-Code-driven** edits (where `running_as_agent` is false), as manual checkpoints. They do nothing for agent runs. (History: an earlier design gated these for agents behind `--confirmed-by`/`--reviewer` and then an out-of-band nonce; both were friction on the wrong party — an agent fabricated a `## User confirmation` quote, then typed `--confirmed-by mike` itself. Removing the human gate for agent runs entirely, and reviewing the output instead, is cleaner and matches "hand it a video from my phone and get an edit back".)
+The `--confirm-strategy`, `--approve-style`, and `--eval-verdict` commands still exist for **Claude-Code-driven** edits (where `running_as_agent` is false), as manual checkpoints. They do nothing for agent runs. (History: an earlier design gated these for agents behind `--confirmed-by`/`--reviewer` and then an out-of-band nonce; both were friction on the wrong party — an agent fabricated a `## User confirmation` quote, then typed `--confirmed-by mike` itself. Removing the human gate for agent runs entirely, and reviewing the output instead, is cleaner and matches "hand it a video from my phone and get an edit back".)
+
+## Style sample (manual runs with a grade or overlay)
+
+Added 2026-10-19, adapted from a creator's published workflow ("AI with Kyle"): make a small styled sample, get it approved, *then* style the whole video. Before this, EDL validation went straight to a full RENDER — a bad grade choice or a misplaced overlay cost a full render (background matte included, which is the slow step) to discover.
+
+STYLE_SAMPLE sits between EDL and RENDER. It's a no-op unless `edl.json` sets a `grade` other than `none`/empty, or has `overlays` — captions alone never trigger it (`render.py --build-subtitles` always burns them, so gating on that would fire every single edit and become a third rubber-stamp). When it does trigger, the pipeline picks the one kept range closest to 30s (window 15–45s), builds a one-range sub-EDL carrying the same grade/overlay/background, and renders it to `<edit>/style_sample.mp4`. Review that file, then:
+
+- Looks right → `pipeline.py <dir> --approve-style` → phase RENDER.
+- Needs a change → edit `edl.json`'s `grade`/`overlays` fields, then `pipeline.py <dir> --restage edl` (this also clears the stale sample and re-triggers the gate against your edit).
+
+**Agent-started runs always skip this phase, styled or not** — consistent with the 2026-09-09 decision to remove every mid-run human gate from Jensen/Beast runs ("review the finished video, not the plan"). Re-adding a gate here for agent runs would relitigate that call for no reason; Mike still sees the styling choice in the finished `final.mp4` at the usual DONE ping.
+
+## Corrections keep history
+
+Added 2026-10-19, same source. A `--restage edl` or `--restage render` is almost always "Mike reviewed the output and asked for a change" — so rather than silently overwrite `final.mp4`, the outgoing render is archived to `<edit>/exports/vN_<timestamp>.mp4` first. `final.mp4` stays the one current render everywhere else in the pipeline (SELF_EVAL, the DONE ping, `project.md`); `exports/` is purely a comparable history of prior versions, not a second canonical output.
 
 ## If the pipeline refuses
 
@@ -175,6 +197,7 @@ The `--confirm-strategy` and `--eval-verdict` commands still exist for **Claude-
   `render.py --force` — the pipeline doesn't use it and neither should you here.
 - **`INGEST FAILED: …`** — transcription failed or produced a non-verbatim file.
   Check `<edit>/jobs/*.log`.
+- **`REFUSED: no rendered style sample at … yet`** (Claude-Code runs only) — run `pipeline.py <dir>` first to generate `style_sample.mp4` before `--approve-style`.
 - **`REFUSED: --eval-verdict pass requires a real review …`** (Claude-Code runs only) — inspect every `eval/*.png` and write a per-frame assessment to `eval/eval_review.md` first. `--eval-verdict fail` never needs the review. Agent-started runs never see this — `qc_render.py` writes the review and sets the verdict automatically.
 
 ## Cut craft (techniques)
@@ -186,6 +209,7 @@ The `--confirm-strategy` and `--eval-verdict` commands still exist for **Claude-
 - **Silence gaps are cut candidates.** Silences ≥400ms are usually the cleanest. 150–400ms phrase boundaries are usable with a visual check. <150ms is unsafe (mid-phrase).
 - **Example cut padding** (the launch video shipped with this): 50ms before the first kept word, 80ms after the last. Tighter for montage energy, looser for documentary. Stay in the 30–200ms working window (Hard Rule 7).
 - **Never reason audio and video independently.** Every cut must work on both tracks.
+- **Editor meta-commentary is its own cut category, distinct from fillers and retakes.** Lines the speaker addresses to the editor rather than the viewer — "cut that," "let's redo that part," "can you remove this bit" — are never content, even when fluent and filler-free (so `strip_fillers` and retake-selection both miss them). Treat them exactly like a retake: end a range before it, start the next one after, and declare the span in `omissions` with a reason.
 
 ## The packed transcript (primary reading view)
 
@@ -237,6 +261,18 @@ OUTPUT (JSON array, no prose):
 Return the final EDL and a one-line total runtime check.
 ```
 
+## Learning style from reference clips (when requested)
+
+Added 2026-10-19, adapted from a creator's published workflow ("AI with Kyle"). Use this when the user hands you 2-3 clips they like (their own prior work, or someone else's) instead of (or alongside) describing a style in words. The goal is a persistent `<videos_dir>/style-guide.md` — a sibling of `edit/`, not inside it, so it survives across every edit in that project folder, unlike `strategy.md`/`project.md` which are per-edit.
+
+1. **Inspect each reference, picture and sound, separately.** Picture: pull 3-5 `timeline_view.py` frames spread across the clip. Sound: a quick `transcribe.py` pass gives you pacing (words/sec, pause lengths) and caption-worthy phrasing; you cannot literally listen to audio, so ask the user directly about anything audio-only you can't infer from the transcript (music, tone, sound effects).
+2. **Describe what you actually observed** — pacing, framing, caption chunking/placement, when a graphic appears relative to the words being said — before proposing anything. If a referenced file won't open or a timestamp doesn't exist, say so by name; don't guess.
+3. **Ask the user what they like and don't like**, specifically — not "do you like this clip" but which concrete choice (a caption style, a cut rhythm, when a diagram showed up) to keep or avoid.
+4. **Write `style-guide.md`** with every major choice linked to a `reference filename + timestamp` it came from, and clearly separate "observed in the reference" from "my proposed choice based on it." Use real brand assets (logo/fonts/colors) if the user has them, not placeholders.
+5. **Show the style guide before applying it.** Don't touch the actual edit until the user has confirmed it — same gate as strategy confirmation, just for style instead of cut structure.
+
+Once approved, `style-guide.md` is a standing reference for every future edit in this project folder — read it (alongside `project.md`) before proposing a strategy on a new recording, the same way you'd read `project.md`'s last session summary.
+
 ## Color grade (when requested)
 
 Your job is to **reason about the image**, not apply a preset. Look at a frame (via `timeline_view`), decide what's wrong, adjust one thing, look again.
@@ -275,6 +311,19 @@ Invent a third style if neither fits. Hard rules: subtitles LAST (Rule 1), outpu
 ## Animations (when requested)
 
 Animations match the content and the brand. **Get the palette, font, and visual language from the conversation** — never assume a default. If the user hasn't told you, propose a palette in the strategy phase and wait for confirmation before building anything.
+
+**Treatment by rhetorical purpose** (added 2026-10-19, from "AI with Kyle" — a quick lookup to shortcut the "what kind of visual does this moment need" question before picking an engine below):
+
+| What the speaker is doing | Treatment |
+|---|---|
+| Explaining a process or sequence | Animated diagram / flow |
+| Comparing two or more choices | Side-by-side cards |
+| Demonstrating a tool | Screen capture + cursor |
+| Quoting a brief, message, or spec | A "ticket"/quote card |
+| Showing a format change (e.g. landscape → portrait) | Phone-frame mockup |
+| Just landing emphasis on a word or beat | Kinetic typography + a sound cue |
+
+This is a starting point, not a constraint — invent past it when the material calls for something else (Rule 6).
 
 **Tool options:**
 
