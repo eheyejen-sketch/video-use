@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -882,6 +883,78 @@ def _job_key(out_path: Path) -> str:
     return f"render_{out_path.stem}"
 
 
+# Files render.py writes into the edit dir while rendering. An -o that lands on
+# one of these gets clobbered (or clobbers the render) mid-run.
+_INTERMEDIATE_NAMES = ("base.mp4", "base_preview.mp4", "base_draft.mp4",
+                       "master.srt", "_concat.txt")
+_CLIPS_DIRS = ("clips_graded", "clips_preview", "clips_draft")
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    """True if a and b are the same file: same resolved path (follows symlinks,
+    works for not-yet-existing paths) or, when both exist, the same inode
+    (catches hard links)."""
+    try:
+        if a.resolve() == b.resolve():
+            return True
+        return a.exists() and b.exists() and os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def find_output_aliases(edl_path: Path, edit_dir: Path, out_path: Path) -> list[str]:
+    """Return one message per input (or intermediate) that `out_path` aliases.
+
+    Every ffmpeg call in this module runs with `-y`, so an output path that is
+    the same file as an input silently overwrites the input -- for a source
+    video that means the original footage is gone. This runs before anything is
+    written. An unreadable EDL yields no EDL-derived inputs here; the render
+    itself then fails on the parse as before."""
+    try:
+        edl = json.loads(edl_path.read_text())
+        if not isinstance(edl, dict):
+            edl = {}
+    except (json.JSONDecodeError, OSError):
+        edl = {}
+
+    # (what it is, path it refers to)
+    inputs: list[tuple[str, Path]] = [("the EDL file", edl_path)]
+    sources = edl.get("sources")
+    if isinstance(sources, dict):
+        for name, sp in sources.items():
+            if isinstance(sp, str) and sp:
+                inputs.append((f"source video {name!r}", resolve_path(sp, edit_dir)))
+            inputs.append((f"transcript for {name!r}", edit_dir / "transcripts" / f"{name}.json"))
+    bg = edl.get("background")
+    if isinstance(bg, str) and bg:
+        bg_path = resolve_asset_path(bg, edit_dir, edl)
+        if bg_path is not None:
+            inputs.append(("the background image", bg_path))
+    subs = edl.get("subtitles")
+    if isinstance(subs, str) and subs:
+        inputs.append(("the subtitles file", resolve_path(subs, edit_dir)))
+    overlays = edl.get("overlays")
+    if isinstance(overlays, list):
+        for i, ov in enumerate(overlays):
+            if isinstance(ov, dict) and isinstance(ov.get("file"), str) and ov["file"]:
+                inputs.append((f"overlay #{i}", resolve_path(ov["file"], edit_dir)))
+    for name in _INTERMEDIATE_NAMES:
+        inputs.append((f"render intermediate {name}", edit_dir / name))
+    for d in _CLIPS_DIRS:
+        if out_path.parent.resolve() == (edit_dir / d).resolve():
+            inputs.append((f"render intermediate directory {d}/", out_path))
+    # The loudnorm pre-pass writes <out>.prenorm.mp4; it must not hit an input either.
+    prenorm = out_path.with_suffix(".prenorm.mp4")
+
+    problems: list[str] = []
+    for label, path in inputs:
+        if _same_file(out_path, path):
+            problems.append(f"output {out_path} is the same file as {label} ({path})")
+        elif _same_file(prenorm, path):
+            problems.append(f"the loudnorm temp file {prenorm} is the same file as {label} ({path})")
+    return problems
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Render a video from an EDL")
     ap.add_argument("edl", type=Path, help="Path to edl.json")
@@ -1119,6 +1192,16 @@ def main() -> None:
 
     if args.status:
         sys.exit(_job_lock.print_status_line(edit_dir, job_key, cached_output=out_path))
+
+    # Refuse before spawning a worker or writing anything: ffmpeg runs with -y,
+    # so an -o that aliases an input would overwrite it (source footage included).
+    alias_problems = find_output_aliases(edl_path, edit_dir, out_path)
+    if alias_problems:
+        sys.exit(
+            "REFUSING TO RENDER -- output path aliases an input; nothing was written:\n  - "
+            + "\n  - ".join(alias_problems)
+            + f"\nPick a different -o (for example {edit_dir / 'final.mp4'})."
+        )
 
     if args._worker:
         # Runs detached, spawned by the block below. Does the real render and
